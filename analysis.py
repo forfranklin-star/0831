@@ -12,6 +12,7 @@ import hashlib
 import warnings
 from datetime import datetime, timedelta
 from functools import wraps
+from http.client import RemoteDisconnected
 
 import numpy as np
 import pandas as pd
@@ -74,11 +75,150 @@ def cache_pickle(expire_seconds=3600):
 
 
 # ============================================================
-# 1. 数据获取
+# 1. 数据获取（多数据源自动降级机制）
 # ============================================================
-@cache_pickle(expire_seconds=86400)
-def fetch_stock_data(code, start_date, end_date):
-    """获取A股前复权日线数据（akshare）。"""
+# 数据源优先级列表：按顺序依次尝试，第一个成功的即使用
+#   1. AkShare-东方财富  —— 国内首选，前复权质量最好
+#   2. AkShare-新浪财经  —— 国内备用
+#   3. Yahoo Finance     —— 海外终极回退，访问极稳定
+# ============================================================
+
+def _set_default_timeout(timeout=30):
+    """
+    全局设置 requests 默认超时时间。
+    akshare/yfinance 内部调用 requests 时通常不传 timeout，
+    在海外环境容易因网络延迟导致连接中断。通过 monkeypatch 注入默认超时。
+    """
+    import requests
+    if not hasattr(requests, '_original_get'):
+        requests._original_get = requests.get
+        requests._original_session_get = requests.Session.get
+
+    def _get_with_timeout(url, **kwargs):
+        kwargs.setdefault('timeout', timeout)
+        return requests._original_get(url, **kwargs)
+
+    def _session_get_with_timeout(self, url, **kwargs):
+        kwargs.setdefault('timeout', timeout)
+        return requests._original_session_get(self, url, **kwargs)
+
+    requests.get = _get_with_timeout
+    requests.Session.get = _session_get_with_timeout
+
+
+def _setup_requests_session():
+    """配置带重试和浏览器UA的 requests Session。"""
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=5, backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"], raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Connection': 'keep-alive',
+    })
+    return session
+
+
+def _fetch_with_retry(fetch_func, max_retries=3, base_delay=2):
+    """
+    通用重试包装器：对任意数据获取函数进行重试。
+    捕获网络相关异常（ConnectionError/Timeout/RemoteDisconnected等），
+    非网络异常（如参数错误）直接抛出不重试。
+    """
+    import requests
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = fetch_func()
+            if result is not None and (not isinstance(result, pd.DataFrame) or len(result) > 0):
+                return result
+            last_error = ValueError("返回数据为空")
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+                ConnectionError, TimeoutError,
+                RemoteDisconnected, OSError) as e:
+            last_error = e
+            if attempt < max_retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                print(f"[数据获取] 第{attempt}次失败 ({type(e).__name__})，{delay}秒后重试...")
+                time.sleep(delay)
+            continue
+        except Exception as e:
+            raise  # 非网络错误不重试
+    raise ConnectionError(
+        f"重试{max_retries}次后仍失败: {type(last_error).__name__}: {str(last_error)[:150]}"
+    ) from last_error
+
+
+def _standardize_dataframe(df, source_name):
+    """
+    将不同数据源返回的 DataFrame 统一为标准列名：
+    date, open, high, low, close, volume, amount
+    """
+    col_map = {
+        # 东方财富 / akshare 中文列名
+        '日期': 'date', '开盘': 'open', '收盘': 'close',
+        '最高': 'high', '最低': 'low', '成交量': 'volume',
+        '成交额': 'amount', '涨跌幅': 'pct_change', '换手率': 'turnover',
+        # 新浪 / 英文列名
+        'date': 'date', 'open': 'open', 'high': 'high',
+        'low': 'low', 'close': 'close', 'volume': 'volume',
+        'outstanding_share': 'amount',
+        # Yahoo Finance 列名
+        'Open': 'open', 'High': 'high', 'Low': 'low',
+        'Close': 'close', 'Volume': 'volume', 'Adj Close': 'adj_close',
+        'Dividends': 'dividends', 'Stock Splits': 'splits',
+    }
+    df = df.rename(columns=col_map)
+
+    # 处理 Yahoo Finance 的 MultiIndex columns（yfinance 返回的列可能是多级索引）
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+        df = df.rename(columns=col_map)
+
+    # 确保 date 列存在且格式统一
+    if 'date' not in df.columns and df.index.name in ('Date', 'date', None):
+        df = df.reset_index()
+        df = df.rename(columns={df.columns[0]: 'date'})
+
+    df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+
+    # 确保必要列存在
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # 统一数值类型
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    keep = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_change']
+    df = df[[c for c in keep if c in df.columns]]
+    df = df.sort_values('date').drop_duplicates(subset='date').reset_index(drop=True)
+    df = df.ffill().bfill()
+
+    print(f"[数据标准化] 数据源={source_name}, 获得{len(df)}条有效数据")
+    return df
+
+
+# ============================================================
+# 数据源 1: AkShare - 东方财富（国内首选，前复权质量最好）
+# ============================================================
+def _fetch_akshare_eastmoney(code, start_date, end_date):
+    """通过 akshare 东方财富接口获取前复权日线数据。"""
     import akshare as ak
     s = start_date.replace('-', '')
     e = end_date.replace('-', '')
@@ -86,22 +226,130 @@ def fetch_stock_data(code, start_date, end_date):
         symbol=code, period="daily",
         start_date=s, end_date=e, adjust="qfq"
     )
+    return _standardize_dataframe(df, "akshare-eastmoney")
+
+
+# ============================================================
+# 数据源 2: AkShare - 新浪财经（国内备用）
+# ============================================================
+def _fetch_akshare_sina(code, start_date, end_date):
+    """通过 akshare 新浪财经接口获取前复权日线数据。"""
+    import akshare as ak
+    prefix = 'sh' if code.startswith('6') else 'sz'
+    symbol = f"{prefix}{code}"
+    df = ak.stock_zh_a_daily(
+        symbol=symbol, start_date=start_date, end_date=end_date, adjust="qfq"
+    )
+    return _standardize_dataframe(df, "akshare-sina")
+
+
+# ============================================================
+# 数据源 3: Yahoo Finance（海外终极回退，访问极稳定）
+# ============================================================
+def _to_yfinance_ticker(code):
+    """
+    将A股代码转换为 Yahoo Finance ticker 格式：
+      6xxxxx (沪市) → 600519.SS
+      0xxxxx/3xxxxx (深市) → 000001.SZ
+      4xxxxx/8xxxxx (北交所) → 430047.BJ
+    """
+    if code.startswith('6'):
+        return f"{code}.SS"
+    elif code.startswith(('0', '3')):
+        return f"{code}.SZ"
+    elif code.startswith(('4', '8')):
+        return f"{code}.BJ"
+    else:
+        return f"{code}.SS"  # 默认沪市
+
+
+def _fetch_yfinance(code, start_date, end_date):
+    """
+    通过 yfinance 获取A股前复权日线数据。
+    auto_adjust=True 时 OHLC 已按分红拆股调整（等价于前复权）。
+    注意：yfinance 的 end_date 是排他的，需加一天。
+    """
+    import yfinance as yf
+    ticker = _to_yfinance_ticker(code)
+    # end_date 排他，加1天确保包含结束日
+    end_inclusive = (datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+
+    df = yf.download(
+        ticker, start=start_date, end=end_inclusive,
+        auto_adjust=True, progress=False, threads=False
+    )
     if df is None or len(df) == 0:
-        raise ValueError(f"未获取到股票 {code} 在 {start_date}~{end_date} 的数据")
-    col_map = {
-        '日期': 'date', '开盘': 'open', '收盘': 'close',
-        '最高': 'high', '最低': 'low', '成交量': 'volume',
-        '成交额': 'amount', '涨跌幅': 'pct_change', '换手率': 'turnover'
-    }
-    df = df.rename(columns=col_map)
-    df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
-    keep = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_change']
-    df = df[[c for c in keep if c in df.columns]].sort_values('date').reset_index(drop=True)
-    return df
+        raise ValueError(f"Yahoo Finance 未找到 {ticker} 的数据")
+
+    # yfinance 返回以日期为索引的 DataFrame
+    df = df.reset_index()
+    # 处理可能的 MultiIndex 列
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns={'Date': 'date', 'Open': 'open', 'High': 'high',
+                             'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
+    return _standardize_dataframe(df, "yfinance")
+
+
+# ============================================================
+# 数据源优先级配置
+# ============================================================
+# 每个条目: (名称, 获取函数, 重试次数, 基础重试间隔秒)
+DATA_SOURCES = [
+    ("AkShare-东方财富", _fetch_akshare_eastmoney, 3, 2),
+    ("AkShare-新浪财经", _fetch_akshare_sina, 2, 2),
+    ("Yahoo Finance", _fetch_yfinance, 2, 3),
+]
+
+
+@cache_pickle(expire_seconds=86400)
+def fetch_stock_data(code, start_date, end_date):
+    """
+    获取A股前复权日线数据（多数据源自动降级）。
+
+    按 DATA_SOURCES 优先级依次尝试，每个数据源内部带重试，
+    第一个成功返回有效数据的即使用。全部失败则抛出汇总错误。
+
+    参数:
+      code: 6位A股代码，如 '600519'
+      start_date: 'YYYY-MM-DD'
+      end_date: 'YYYY-MM-DD'
+    返回:
+      DataFrame [date, open, high, low, close, volume, amount, pct_change]
+    """
+    # 设置全局网络配置
+    _set_default_timeout(timeout=30)
+    _setup_requests_session()
+
+    errors = []
+    for source_name, fetch_func, max_retries, base_delay in DATA_SOURCES:
+        try:
+            print(f"\n[数据源] 尝试 {source_name} ...")
+            df = _fetch_with_retry(
+                lambda: fetch_func(code, start_date, end_date),
+                max_retries=max_retries, base_delay=base_delay
+            )
+            if df is not None and len(df) > 0:
+                print(f"[数据源] ✅ {source_name} 获取成功，共 {len(df)} 条数据")
+                return df
+            else:
+                errors.append(f"{source_name}: 返回空数据")
+        except Exception as e:
+            err_msg = f"{source_name}: {type(e).__name__}: {str(e)[:120]}"
+            errors.append(err_msg)
+            print(f"[数据源] ❌ {err_msg}")
+            continue
+
+    # 所有数据源均失败
+    error_summary = "\n  ".join(errors)
+    raise ConnectionError(
+        f"股票 {code} 在 {start_date}~{end_date} 的数据获取失败，所有数据源均不可用：\n  {error_summary}\n"
+        f"建议: 1) 检查网络连接 2) 稍后重试 3) 确认股票代码正确 4) 扩大日期范围"
+    )
 
 
 def fetch_recent_data(code, days=150):
-    """获取最近一段交易日数据（用于实时信号）。"""
+    """获取最近一段交易日数据（用于实时信号），缓存2小时。"""
     end = datetime.now().strftime('%Y-%m-%d')
     start = (datetime.now() - timedelta(days=days * 2)).strftime('%Y-%m-%d')
 
@@ -109,7 +357,6 @@ def fetch_recent_data(code, days=150):
     def _fetch(c, s, e):
         return fetch_stock_data(c, s, e)
     return _fetch(code, start, end)
-
 
 # ============================================================
 # 2. 技术指标计算

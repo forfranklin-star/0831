@@ -262,11 +262,16 @@ def _fetch_akshare_sina(code, start_date, end_date, timeframe='daily', is_index=
 # 数据源：Yahoo Finance（海外终极回退）
 # ============================================================
 def _to_yfinance_ticker(code, is_index=False):
+    """
+    转换为 Yahoo Finance ticker 格式。
+    中国个股和指数统一使用 .SS(沪市)/.SZ(深市)/.BJ(北交所) 后缀。
+    注意：^ 前缀仅用于美股指数（如^GSPC），中国指数不用 ^。
+    """
     if is_index:
-        idx = INDEX_MAP.get(code)
-        if idx:
-            return f"^{code}" if code.startswith('000') else f"{code}.{idx['market'].upper()}"
-        return f"^{code}"
+        # 中国指数：深市(399开头)用.SZ，其余(沪市)用.SS
+        if code.startswith('399'):
+            return f"{code}.SZ"
+        return f"{code}.SS"
     if code.startswith('6'):
         return f"{code}.SS"
     elif code.startswith(('0','3')):
@@ -407,13 +412,169 @@ def _fetch_efinance(code, start_date, end_date, timeframe='daily', is_index=Fals
     return _standardize_dataframe(df, f"efinance-{timeframe}")
 
 
+def _fetch_baostock(code, start_date, end_date, timeframe='daily', is_index=False):
+    """
+    通过 baostock 获取数据（TCP协议，非HTTP，海外服务器可能可访问）。
+    支持日线/周线/月线/5分钟/15分钟/30分钟/60分钟，前复权。
+    120分钟由60分钟重采样。
+    """
+    import baostock as bs
+
+    # baostock 代码格式: sh.600519, sz.000001
+    if is_index:
+        bs_code = f"sz.{code}" if code.startswith('399') else f"sh.{code}"
+    else:
+        if code.startswith(('60', '68', '90', '11', '13', '51', '58')):
+            bs_code = f"sh.{code}"
+        else:
+            bs_code = f"sz.{code}"
+
+    # 周期映射
+    freq_map = {'daily': 'd', 'weekly': 'w', 'monthly': 'm',
+                '5min': '5', '15min': '15', '30min': '30', '60min': '60'}
+    frequency = freq_map.get(timeframe, '60' if timeframe == '120min' else None)
+    if frequency is None:
+        raise ValueError(f"baostock 不支持周期: {timeframe}")
+
+    # 复权: 1=后复权, 2=前复权, 3=不复权; 指数不需要复权
+    adjustflag = "3" if is_index else "2"
+
+    lg = bs.login()
+    if lg.error_code != '0':
+        raise ConnectionError(f"baostock 登录失败: {lg.error_msg}")
+
+    try:
+        fields = "date,time,open,high,low,close,volume,amount,pctChg"
+        rs = bs.query_history_k_data_plus(
+            bs_code, fields,
+            start_date=start_date, end_date=end_date,
+            frequency=frequency, adjustflag=adjustflag
+        )
+        if rs.error_code != '0':
+            raise ValueError(f"baostock 查询失败: {rs.error_msg}")
+
+        data_list = []
+        while rs.next():
+            data_list.append(rs.get_row_data())
+    finally:
+        bs.logout()
+
+    if not data_list:
+        raise ValueError(f"baostock 返回空数据: {bs_code} {timeframe}")
+
+    df = pd.DataFrame(data_list, columns=fields.split(','))
+    for col in ['open', 'high', 'low', 'close', 'volume', 'amount', 'pctChg']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # 分钟线合并日期时间
+    if timeframe not in ('daily', 'weekly', 'monthly') and 'time' in df.columns:
+        def _fmt_time(t):
+            t = str(t).zfill(6)
+            return f"{t[:2]}:{t[2:4]}:{t[4:6]}"
+        df['date'] = df['date'] + ' ' + df['time'].apply(_fmt_time)
+
+    df = df.rename(columns={'pctChg': 'pct_change'})
+    if 'time' in df.columns:
+        df = df.drop(columns=['time'])
+
+    # 120分钟重采样
+    if timeframe == '120min':
+        df = _resample_ohlc(df, '120min')
+
+    return _standardize_dataframe(df, f"baostock-{timeframe}")
+
+
+def _fetch_tencent(code, start_date, end_date, timeframe='daily', is_index=False):
+    """
+    通过腾讯财经直连HTTP API获取数据（非akshare封装，可能绕过部分封锁）。
+    支持日线(前复权)/60分钟/30分钟/15分钟，120分钟由60分钟重采样。
+    """
+    import requests
+
+    # 腾讯代码格式: sh600519, sz000001
+    if is_index:
+        prefix = 'sz' if code.startswith('399') else 'sh'
+    else:
+        prefix = 'sh' if code.startswith(('60', '68', '90', '11', '13', '51', '58')) else 'sz'
+    qt_code = f"{prefix}{code}"
+
+    # 计算需要的数据条数
+    start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+    end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+    days = max((end_dt - start_dt).days, 10)
+    if timeframe == 'daily':
+        datalen = min(days + 50, 2000)
+    else:
+        datalen = min(days * 8 + 100, 5000)
+
+    # 构造URL
+    if timeframe == 'daily':
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={qt_code},day,,,{datalen},qfq"
+        data_key = 'qfqday'
+    elif timeframe in ('60min', '120min'):
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/kline/mkline?param={qt_code},m60,,{datalen}"
+        data_key = 'm60'
+    elif timeframe == '30min':
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/kline/mkline?param={qt_code},m30,,{datalen}"
+        data_key = 'm30'
+    elif timeframe == '15min':
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/kline/mkline?param={qt_code},m15,,{datalen}"
+        data_key = 'm15'
+    else:
+        raise ValueError(f"腾讯接口不支持周期: {timeframe}")
+
+    resp = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+    if resp.status_code != 200:
+        raise ConnectionError(f"腾讯接口HTTP {resp.status_code}")
+    data = resp.json()
+
+    if data.get('code') != 0:
+        raise ValueError(f"腾讯接口返回错误: {data.get('msg', 'unknown')}")
+
+    stock_data = data.get('data', {}).get(qt_code, {})
+    kline = stock_data.get(data_key, stock_data.get('day', []))
+
+    if not kline:
+        raise ValueError(f"腾讯接口无K线数据: {qt_code} {timeframe}")
+
+    # 每条数据: [日期, 开, 收, 高, 低, 成交量] (注意顺序: 开收高低)
+    df = pd.DataFrame(kline)
+    if df.shape[1] >= 6:
+        df = df.iloc[:, :6]
+        df.columns = ['date', 'open', 'close', 'high', 'low', 'volume']
+    elif df.shape[1] >= 5:
+        df = df.iloc[:, :5]
+        df.columns = ['date', 'open', 'close', 'high', 'low']
+        df['volume'] = 0
+    else:
+        raise ValueError(f"腾讯接口数据格式异常: {df.shape}")
+
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # 按日期范围过滤
+    df['date'] = df['date'].astype(str)
+    mask = (df['date'] >= start_date) & (df['date'] <= end_date + ' 23:59:59')
+    df = df[mask].copy()
+    if len(df) == 0:
+        raise ValueError(f"腾讯接口在 {start_date}~{end_date} 范围内无数据")
+
+    # 120分钟重采样
+    if timeframe == '120min':
+        df = _resample_ohlc(df, '120min')
+
+    return _standardize_dataframe(df, f"tencent-{timeframe}")
+
+
 # ============================================================
 # 数据源优先级配置（支持周期和指数参数）
-# 国外服务器建议顺序：同花顺 → Yahoo → 东方财富 → 新浪
+# 国外服务器优化顺序：Yahoo(最稳) → baostock(TCP) → 腾讯直连 → 同花顺 → 东方财富 → 新浪
 # ============================================================
 DATA_SOURCES = [
-    ("efinance-同花顺", _fetch_efinance, 2, 2),
     ("Yahoo Finance", _fetch_yfinance, 2, 3),
+    ("baostock", _fetch_baostock, 1, 2),
+    ("腾讯财经", _fetch_tencent, 1, 2),
+    ("efinance-同花顺", _fetch_efinance, 1, 1),
     ("AkShare-东方财富", _fetch_akshare_eastmoney, 2, 2),
     ("AkShare-新浪财经", _fetch_akshare_sina, 1, 1),
 ]

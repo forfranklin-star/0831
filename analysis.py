@@ -1047,8 +1047,13 @@ def compute_model_signals(df, model):
 # ============================================================
 # 模型命名存储与加载
 # ============================================================
-def save_model(model, metrics=None, backtest_info=None):
-    """将模型保存为JSON文件，支持命名存储。"""
+def save_model(model, metrics=None, backtest_info=None, custom_name=None):
+    """将模型保存为JSON文件，支持命名存储。
+    custom_name: 如提供，则覆盖模型名称用于保存和存储。
+    """
+    if custom_name:
+        model = dict(model)  # 浅拷贝，避免修改原对象
+        model['name'] = custom_name
     model_data = {
         'model': model,
         'metrics': metrics or {},

@@ -168,8 +168,8 @@ with st.sidebar:
         stock_code = index_options[selected_idx]
         is_index = True
     else:
-        stock_code = st.text_input("股票代码", value="600519",
-                                    help="6位代码，如 600519(茅台)、000001(平安银行)、600118(中国卫星)")
+        stock_code = st.text_input("股票代码", value="600141",
+                                    help="6位代码，如 600141(兴发集团)、600519(茅台)、000001(平安银行)、600118(中国卫星)")
         is_index = False
 
     tf_options = {v['name']: k for k, v in analysis.TIMEFRAMES.items()}
@@ -324,12 +324,26 @@ if result:
                     f"买{len(model['buy_rules'])}/卖{len(model['sell_rules'])}指标",
                     delta=f"淘汰{len(model['buy_eliminated'])}个")
 
-    if model_name:
-        if st.button(f"💾 保存模型: {model_name}", type="primary"):
-            analysis.save_model(model, metrics=metrics,
-                                backtest_info={'code': stock_code, 'timeframe': timeframe,
-                                               'start': result['start_date'], 'end': result['end_date']})
-            st.success(f"✅ 模型 '{model_name}' 已保存！侧边栏可加载使用")
+    # 模型命名保存区域（分析完成后始终可见）
+    st.markdown("#### 💾 保存当前模型")
+    default_save_name = model.get('name', '') if model.get('name') and not model['name'].startswith('实时_') else ''
+    save_name = st.text_input("模型名称", value=default_save_name, key="save_model_name",
+                               placeholder="输入名称后点击保存，如：兴发集团_均衡_2024",
+                               help="保存后可在侧边栏「已保存模型」中加载，或用于实时信号")
+    col_save1, col_save2 = st.columns([1, 3])
+    with col_save1:
+        if st.button("💾 保存模型", type="primary", use_container_width=True):
+            if not save_name.strip():
+                st.error("❌ 请输入模型名称")
+            else:
+                analysis.save_model(model, metrics=metrics,
+                                    backtest_info={'code': stock_code, 'timeframe': timeframe,
+                                                   'start': result['start_date'], 'end': result['end_date']},
+                                    custom_name=save_name.strip())
+                st.success(f"✅ 模型 '{save_name.strip()}' 已保存！侧边栏可加载，实时信号可调用")
+    with col_save2:
+        st.caption(f"当前模型：{model.get('name','未命名')} | 灵敏度：{model['sensitivity_name']} | "
+                   f"买点指标：{len(model['buy_rules'])}个 | 卖点指标：{len(model['sell_rules'])}个")
 
     st.markdown("---")
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([

@@ -199,7 +199,17 @@ with st.sidebar:
 
     st.markdown("---")
     analyze_btn = st.button("🚀 开始分析", type="primary", use_container_width=True)
-    signal_btn = st.button("📡 获取实时信号", use_container_width=True)
+
+    st.markdown("#### 📡 实时信号")
+    saved_models_for_signal = analysis.list_saved_models()
+    signal_model_options = ["自动构建模型（基于当前灵敏度）"]
+    if st.session_state.current_model:
+        signal_model_options.insert(0, f"📌 当前加载: {st.session_state.current_model['name']}")
+    for m in saved_models_for_signal:
+        signal_model_options.append(f"💾 {m['name']} ({m['sensitivity']})")
+    selected_signal_model = st.selectbox("信号使用的模型", signal_model_options,
+                                          help="选择已保存的模型生成信号，或自动构建")
+    signal_btn = st.button("📡 获取实时信号", use_container_width=True, type="primary")
 
     st.markdown("---")
     st.markdown("### 💾 已保存模型")
@@ -259,13 +269,29 @@ def run_signal():
     code = stock_code.strip()
     if not code or not code.isdigit() or len(code) != 6:
         st.error("❌ 请输入6位数字代码"); return
-    with st.spinner(f"正在获取 {code} 实时信号..."):
+
+    # 解析选择的模型
+    signal_model = None
+    sel = selected_signal_model
+    if sel.startswith("📌 当前加载:"):
+        signal_model = st.session_state.current_model
+    elif sel.startswith("💾"):
+        # 从 "💾 模型名 (灵敏度)" 中提取模型名
+        model_name = sel[2:].split(' (')[0]
+        loaded, _, _ = analysis.load_model(model_name)
+        signal_model = loaded
+        st.session_state.current_model = loaded
+    # else: 自动构建，model=None
+
+    with st.spinner(f"正在获取 {code} 实时信号（模型: {sel}）..."):
         try:
             sig = analysis.generate_realtime_signal(
                 code=code, timeframe=timeframe, is_index=is_index,
-                model=st.session_state.current_model, sensitivity=sensitivity)
+                model=signal_model, sensitivity=sensitivity)
             st.session_state.signal_result = sig
-            st.success(f"✅ {sig['signal']} | 强度{sig['signal_strength']*100:.1f}% | 买{sig['buy_probability']*100:.1f}%/卖{sig['sell_probability']*100:.1f}%")
+            st.success(f"✅ {sig['signal']} | 强度{sig['signal_strength']*100:.1f}% | "
+                       f"买{sig['buy_probability']*100:.1f}%/卖{sig['sell_probability']*100:.1f}% | "
+                       f"模型: {sig.get('model_name','自动')}")
         except Exception as e:
             st.error(f"❌ 获取信号失败: {str(e)}"); st.exception(e)
 
@@ -439,14 +465,37 @@ if result:
 # ============================================================
 # 实时信号
 # ============================================================
+def _render_indicator_card(ind, side='buy'):
+    """渲染单个指标触发状态卡片"""
+    triggered = ind['triggered']
+    stt = "✓ 触发" if triggered else "✗ 未触发"
+    stc = "#2e7d32" if triggered else "#999"
+    bg = "#e8f5e9" if triggered else "#fafafa"
+    bd = "#4caf50" if triggered else "#e0e0e0"
+    dt = "偏高" if ind['direction'] == 'high' else "偏低"
+    side_color = "#ef5350" if side == 'buy' else "#26a69a"
+    return f"""
+    <div style="background:{bg};padding:8px 12px;border-radius:6px;margin-bottom:5px;border-left:3px solid {bd};">
+        <strong style="color:{side_color};">{ind['indicator']}</strong>
+        <span style="float:right;color:{stc};font-weight:600;font-size:12px;">{stt}</span>
+        <br><span style="font-size:11px;color:#555;">
+            当前值:<strong>{ind['value']:.4f}</strong> | 阈值:{ind['threshold']:.4f} |
+            方向:{dt} | 权重:{ind['weight']} | r={ind.get('corr',0):.3f}
+        </span>
+    </div>"""
+
+
 if st.session_state.signal_result:
     sig = st.session_state.signal_result
     st.markdown("---")
     st.markdown("### 📡 实时买卖信号")
-    sc = 'signal-buy' if sig['signal']=='买入' else ('signal-sell' if sig['signal']=='卖出' else 'signal-hold')
-    scolor = '#c62828' if sig['signal']=='买入' else ('#00695c' if sig['signal']=='卖出' else '#e65100')
-    s1, s2 = st.columns([1, 2])
-    with s1:
+
+    sc = 'signal-buy' if sig['signal'] == '买入' else ('signal-sell' if sig['signal'] == '卖出' else 'signal-hold')
+    scolor = '#c62828' if sig['signal'] == '买入' else ('#00695c' if sig['signal'] == '卖出' else '#e65100')
+
+    # 顶部：信号大卡片 + 操作建议说明
+    top1, top2 = st.columns([1, 2])
+    with top1:
         st.markdown(f"""
         <div class="{sc}">
             <div style="font-size:12px;color:#555;margin-bottom:6px;">当前操作建议</div>
@@ -459,27 +508,47 @@ if st.session_state.signal_result:
                 <div><div style="font-size:10px;color:#888;">卖点概率</div><div style="font-size:16px;font-weight:700;color:#26a69a;">{sig['sell_probability']*100:.1f}%</div></div>
             </div>
         </div>""", unsafe_allow_html=True)
+
+    with top2:
+        st.markdown(f"""
+        <div style="background:#f5f5f5;padding:14px 18px;border-radius:8px;border-left:4px solid {scolor};">
+            <div style="font-size:13px;font-weight:600;color:#333;margin-bottom:6px;">📋 操作建议说明</div>
+            <div style="font-size:13px;color:#444;line-height:1.7;">{sig.get('action_description', '')}</div>
+        </div>""", unsafe_allow_html=True)
         st.markdown("")
-        st.caption(f"数据: {sig['date']} | 周期: {sig.get('timeframe','日线')}")
-        st.caption(f"模型: {sig.get('model_name','')} ({sig.get('sensitivity','')})")
-        st.caption(f"收盘: ¥{sig['close']} | 量: {sig['volume']:,}")
-    with s2:
-        st.markdown("**🔍 触发信号的关键指标状态**")
-        for ind in sig['key_indicators']:
-            stt = "✓ 触发" if ind['triggered'] else "✗ 未触发"
-            stc = "#2e7d32" if ind['triggered'] else "#999"
-            bg = "#e8f5e9" if ind['triggered'] else "#f5f5f5"
-            bd = "#4caf50" if ind['triggered'] else "#ccc"
-            dt = "偏高" if ind['direction']=='high' else "偏低"
-            st.markdown(f"""
-            <div style="background:{bg};padding:8px 12px;border-radius:6px;margin-bottom:5px;border-left:3px solid {bd};">
-                <strong>{ind['indicator']}</strong>
-                <span style="float:right;color:{stc};font-weight:600;font-size:12px;">{stt}</span>
-                <br><span style="font-size:11px;color:#555;">
-                    值:<strong>{ind['value']:.4f}</strong> | 阈值:{ind['threshold']:.4f} |
-                    方向:{dt} | 权重:{ind['weight']} | r={ind.get('corr',0):.3f}
-                </span>
-            </div>""", unsafe_allow_html=True)
+        info1, info2, info3, info4 = st.columns(4)
+        info1.caption(f"**数据时间**: {sig['date']}")
+        info2.caption(f"**周期**: {sig.get('timeframe', '日线')}")
+        info3.caption(f"**模型**: {sig.get('model_name', '自动构建')}")
+        info4.caption(f"**收盘价**: ¥{sig['close']} | 量: {sig['volume']:,}")
+
+    st.markdown("")
+
+    # 底部：全部买点指标 + 全部卖点指标
+    buy_inds = sig.get('buy_indicators', [])
+    sell_inds = sig.get('sell_indicators', [])
+    buy_trig = sig.get('buy_triggered_count', sum(1 for i in buy_inds if i['triggered']))
+    sell_trig = sig.get('sell_triggered_count', sum(1 for i in sell_inds if i['triggered']))
+    buy_total = sig.get('buy_total_count', len(buy_inds))
+    sell_total = sig.get('sell_total_count', len(sell_inds))
+
+    col_buy, col_sell = st.columns(2)
+
+    with col_buy:
+        st.markdown(f"#### 🟢 买点指标触发状态（{buy_trig}/{buy_total} 触发）")
+        if buy_inds:
+            for ind in buy_inds:
+                st.markdown(_render_indicator_card(ind, 'buy'), unsafe_allow_html=True)
+        else:
+            st.info("模型无买点指标规则")
+
+    with col_sell:
+        st.markdown(f"#### 🔴 卖点指标触发状态（{sell_trig}/{sell_total} 触发）")
+        if sell_inds:
+            for ind in sell_inds:
+                st.markdown(_render_indicator_card(ind, 'sell'), unsafe_allow_html=True)
+        else:
+            st.info("模型无卖点指标规则")
 
 
 # 空状态

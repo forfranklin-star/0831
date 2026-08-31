@@ -1276,19 +1276,41 @@ def generate_realtime_signal(code, timeframe='daily', is_index=False, model=None
     else:
         signal = '持有'; strength = max(lb, ls)
 
-    key_indicators = []
-    active = model['buy_rules'] if signal == '买入' else (model['sell_rules'] if signal == '卖出'
-                                                              else model['buy_rules'][:3] + model['sell_rules'][:3])
-    for r in active[:8]:
-        col = r['indicator']
-        if col not in df.columns: continue
+    # 构建全部买卖指标的触发状态（不只是前8个，全部展示）
+    def _check_rule(rule):
+        col = rule['indicator']
+        if col not in df.columns:
+            return None
         val = float(latest[col])
-        sign = 1 if r['direction'] == 'high' else -1
-        key_indicators.append({
-            'indicator': col, 'value': round(val,4), 'threshold': r['threshold'],
-            'direction': r['direction'], 'weight': r['weight'],
-            'corr': r.get('corr', 0), 'triggered': bool(sign*(val - r['threshold']) > 0)
-        })
+        sign = 1 if rule['direction'] == 'high' else -1
+        triggered = bool(sign * (val - rule['threshold']) > 0)
+        return {
+            'indicator': col, 'value': round(val, 4),
+            'threshold': round(rule['threshold'], 4),
+            'direction': rule['direction'], 'weight': rule['weight'],
+            'corr': round(rule.get('corr', 0), 4),
+            'pvalue': round(rule.get('pvalue', 0), 4),
+            'triggered': triggered,
+            'contribution': round(rule['weight'] * (1 if triggered else 0), 4)
+        }
+
+    all_buy_indicators = [r for r in (_check_rule(r) for r in model['buy_rules']) if r]
+    all_sell_indicators = [r for r in (_check_rule(r) for r in model['sell_rules']) if r]
+
+    buy_triggered = sum(1 for r in all_buy_indicators if r['triggered'])
+    sell_triggered = sum(1 for r in all_sell_indicators if r['triggered'])
+
+    # 生成操作建议说明
+    if signal == '买入':
+        action_desc = (f"买点概率 {lb*100:.1f}% ≥ 阈值 {model['buy_threshold_prob']*100:.0f}%，"
+                       f"且高于卖点概率 {ls*100:.1f}%。{buy_triggered}/{len(all_buy_indicators)} 个买点指标触发。")
+    elif signal == '卖出':
+        action_desc = (f"卖点概率 {ls*100:.1f}% ≥ 阈值 {model['sell_threshold_prob']*100:.0f}%，"
+                       f"且高于买点概率 {lb*100:.1f}%。{sell_triggered}/{len(all_sell_indicators)} 个卖点指标触发。")
+    else:
+        action_desc = (f"买点概率 {lb*100:.1f}% / 卖点概率 {ls*100:.1f}%，均未达到阈值"
+                       f"（买≥{model['buy_threshold_prob']*100:.0f}% / 卖≥{model['sell_threshold_prob']*100:.0f}%）。"
+                       f"买{buy_triggered}/{len(all_buy_indicators)}触发，卖{sell_triggered}/{len(all_sell_indicators)}触发。建议观望。")
 
     return {
         'code': code, 'timeframe': timeframe, 'is_index': is_index,
@@ -1297,7 +1319,14 @@ def generate_realtime_signal(code, timeframe='daily', is_index=False, model=None
         'low': round(float(latest['low']),2), 'volume': int(latest['volume']),
         'signal': signal, 'signal_strength': round(strength,4),
         'buy_probability': round(lb,4), 'sell_probability': round(ls,4),
-        'key_indicators': key_indicators,
+        'action_description': action_desc,
+        'buy_indicators': all_buy_indicators,
+        'sell_indicators': all_sell_indicators,
+        'buy_triggered_count': buy_triggered,
+        'sell_triggered_count': sell_triggered,
+        'buy_total_count': len(all_buy_indicators),
+        'sell_total_count': len(all_sell_indicators),
+        'key_indicators': all_buy_indicators[:5] + all_sell_indicators[:5],  # 兼容旧字段
         'model_name': model.get('name',''), 'sensitivity': model.get('sensitivity_name',''),
         'model_threshold_buy': model['buy_threshold_prob'],
         'model_threshold_sell': model['sell_threshold_prob']

@@ -355,6 +355,10 @@ def _fetch_yfinance(code, start_date, end_date, timeframe='daily', is_index=Fals
 
     # 按用户请求的日期范围过滤
     df['date'] = pd.to_datetime(df['date'])
+    # 移除时区信息（Yahoo Finance分钟线返回带时区的datetime，如Asia/Shanghai，
+    # 与无时区的start_date比较会报TypeError）
+    if df['date'].dt.tz is not None:
+        df['date'] = df['date'].dt.tz_localize(None)
     mask = (df['date'] >= pd.to_datetime(start_date)) & (df['date'] <= pd.to_datetime(end_inclusive))
     df = df[mask].copy()
     if len(df) == 0:
@@ -444,7 +448,13 @@ def _fetch_baostock(code, start_date, end_date, timeframe='daily', is_index=Fals
         raise ConnectionError(f"baostock 登录失败: {lg.error_msg}")
 
     try:
-        fields = "date,time,open,high,low,close,volume,amount,pctChg"
+        # 分钟线不支持pctChg字段；日线/周线不需要time字段
+        is_minute = timeframe not in ('daily', 'weekly', 'monthly')
+        if is_minute:
+            fields = "date,time,open,high,low,close,volume,amount"
+        else:
+            fields = "date,open,high,low,close,volume,amount,pctChg"
+
         rs = bs.query_history_k_data_plus(
             bs_code, fields,
             start_date=start_date, end_date=end_date,
@@ -463,7 +473,10 @@ def _fetch_baostock(code, start_date, end_date, timeframe='daily', is_index=Fals
         raise ValueError(f"baostock 返回空数据: {bs_code} {timeframe}")
 
     df = pd.DataFrame(data_list, columns=fields.split(','))
-    for col in ['open', 'high', 'low', 'close', 'volume', 'amount', 'pctChg']:
+    num_cols = ['open', 'high', 'low', 'close', 'volume', 'amount']
+    if 'pctChg' in df.columns:
+        num_cols.append('pctChg')
+    for col in num_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
     # 分钟线合并日期时间

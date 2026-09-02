@@ -215,7 +215,17 @@ def _standardize_dataframe(df, source_name):
     keep = ['date','open','high','low','close','volume','amount','pct_change']
     df = df[[c for c in keep if c in df.columns]]
     df = df.sort_values('date').drop_duplicates(subset='date').reset_index(drop=True)
-    df = df.ffill().bfill()
+    # 关键：丢弃OHLC缺失的行，绝不用相邻价格填充（避免伪造数据）
+    before = len(df)
+    df = df.dropna(subset=['open', 'high', 'low', 'close'])
+    dropped = before - len(df)
+    if dropped > 0:
+        print(f"[数据标准化] 警告: 丢弃{dropped}条OHLC缺失的无效数据（不填充）")
+    # volume为0或NaN的行保留（停牌等情况），但amount/pct_change缺失用0填充（非价格字段）
+    if 'amount' in df.columns:
+        df['amount'] = df['amount'].fillna(0)
+    if 'pct_change' in df.columns:
+        df['pct_change'] = df['pct_change'].fillna(0)
     print(f"[数据标准化] 数据源={source_name}, 获得{len(df)}条有效数据")
     return df
 
@@ -821,9 +831,16 @@ def calc_indicators(df):
     # 去除预热期（MA120需要120根K线，一目均衡表需要52根）
     warmup = 120
     d = d.iloc[warmup:].reset_index(drop=True)
-    d = d.ffill().bfill()
-    # 替换inf
-    d = d.replace([np.inf, -np.inf], np.nan).ffill().bfill()
+    # 替换inf为NaN
+    d = d.replace([np.inf, -np.inf], np.nan)
+    # 仅前向填充（不后向填充，避免用未来数据填充早期值的未来函数）
+    d = d.ffill()
+    # 仍有NaN的行（如前向填充不到的首行）直接丢弃，绝不伪造数据
+    before = len(d)
+    d = d.dropna()
+    dropped = before - len(d)
+    if dropped > 0:
+        print(f"[指标计算] 丢弃{dropped}条仍含NaN的行（不填充）")
     return d
 
 

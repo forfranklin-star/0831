@@ -437,6 +437,7 @@ if result:
                             unsafe_allow_html=True)
 
     with tab5:
+        st.warning("⚠️ **样本内回测说明**：本回测的模型规则（指标阈值、权重）是在同一时间段的数据上构建的，属于样本内测试（in-sample），结果可能高估模型实际表现。实盘使用前应进行样本外（out-of-sample）验证或滚动回测。")
         mc = st.columns(5)
         mc[0].metric("期末权益", f"¥{metrics['final_equity']:,.0f}")
         mc[1].metric("总收益率", f"{metrics['total_return']}%")

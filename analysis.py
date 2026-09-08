@@ -929,6 +929,7 @@ SENSITIVITY_CONFIG = {
         'min_indicators': 8,     # 最少指标数
         'max_indicators': 15,    # 最多指标数
         'prob_threshold': 0.70,  # 信号概率阈值
+        'min_prob_gap': 0.15,    # 买卖概率最小差距（防止两者同时高）
         'description': '高门槛筛选，仅保留强相关指标，信号少但准'
     },
     'balanced': {
@@ -938,6 +939,7 @@ SENSITIVITY_CONFIG = {
         'min_indicators': 5,
         'max_indicators': 12,
         'prob_threshold': 0.60,
+        'min_prob_gap': 0.10,
         'description': '标准筛选，兼顾信号数量与质量'
     },
     'aggressive': {
@@ -947,6 +949,7 @@ SENSITIVITY_CONFIG = {
         'min_indicators': 3,
         'max_indicators': 10,
         'prob_threshold': 0.50,
+        'min_prob_gap': 0.05,
         'description': '低门槛筛选，信号频繁但需注意假信号'
     }
 }
@@ -1008,6 +1011,31 @@ def build_model(df, buy_corr, sell_corr, sensitivity='balanced', model_name=None
     buy_rules, buy_selected, buy_eliminated = _select_and_build(buy_corr, 'buy')
     sell_rules, sell_selected, sell_eliminated = _select_and_build(sell_corr, 'sell')
 
+    # 规则去冲突：同一指标不能同时出现在买点和卖点规则中
+    # 保留相关性更强（abs_corr更大）的一方，另一方移入被淘汰列表
+    buy_indicators = {r['indicator']: r for r in buy_rules}
+    sell_indicators = {r['indicator']: r for r in sell_rules}
+    conflict_indicators = set(buy_indicators.keys()) & set(sell_indicators.keys())
+    conflict_removed_buy = []
+    conflict_removed_sell = []
+    for ind in conflict_indicators:
+        b_corr = abs(buy_indicators[ind].get('corr', 0))
+        s_corr = abs(sell_indicators[ind].get('corr', 0))
+        if b_corr >= s_corr:
+            # 保留买点，移除卖点
+            sell_rules = [r for r in sell_rules if r['indicator'] != ind]
+            conflict_removed_sell.append({'indicator': ind, 'corr': sell_indicators[ind].get('corr', 0),
+                                           'pvalue': sell_indicators[ind].get('pvalue', 0),
+                                           'reason': '与买点规则冲突（买点相关性更强）'})
+        else:
+            # 保留卖点，移除买点
+            buy_rules = [r for r in buy_rules if r['indicator'] != ind]
+            conflict_removed_buy.append({'indicator': ind, 'corr': buy_indicators[ind].get('corr', 0),
+                                          'pvalue': buy_indicators[ind].get('pvalue', 0),
+                                          'reason': '与卖点规则冲突（卖点相关性更强）'})
+    buy_eliminated = conflict_removed_buy + buy_eliminated
+    sell_eliminated = conflict_removed_sell + sell_eliminated
+
     model = {
         'name': model_name or f"模型_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         'type': '阈值加权打分系统 v2.0（全指标自动筛选）',
@@ -1029,11 +1057,13 @@ def build_model(df, buy_corr, sell_corr, sensitivity='balanced', model_name=None
                             for c in sell_eliminated],
         'buy_threshold_prob': cfg['prob_threshold'],
         'sell_threshold_prob': cfg['prob_threshold'],
+        'min_prob_gap': cfg['min_prob_gap'],
         'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'formula': (
             'score = Σ [ weight_i × sigmoid( (value_i - threshold_i) / std_i × sign_i ) ]\n'
             'prob = score / Σ weight_i\n'
-            'sign_i = +1 (direction=high), -1 (direction=low)'
+            'sign_i = +1 (direction=high), -1 (direction=low)\n'
+            '信号触发: prob > threshold AND prob > other_prob + min_prob_gap'
         )
     }
     return model
@@ -1141,6 +1171,7 @@ def delete_model(model_name):
 def backtest(df, model, buy_probs, sell_probs):
     buy_th = model['buy_threshold_prob']
     sell_th = model['sell_threshold_prob']
+    min_gap = model.get('min_prob_gap', 0.1)  # 买卖概率最小差距，防止两者同时高
     n = len(df)
     cash = INITIAL_CAPITAL
     shares = 0
@@ -1152,7 +1183,8 @@ def backtest(df, model, buy_probs, sell_probs):
         if i < n - 1:
             exec_price = float(df['open'].iloc[i+1])
             exec_date = str(df['date'].iloc[i+1])
-            if position is None and buy_probs[i] >= buy_th:
+            # 买入条件：概率≥阈值 且 买概率 > 卖概率 + 最小差距
+            if position is None and buy_probs[i] >= buy_th and buy_probs[i] > sell_probs[i] + min_gap:
                 max_cost = cash / (1 + COMMISSION_RATE)
                 buy_shares = int(max_cost / exec_price / 100) * 100
                 if buy_shares >= 100:
@@ -1165,7 +1197,8 @@ def backtest(df, model, buy_probs, sell_probs):
                         position = {'buy_date': exec_date, 'buy_price': round(exec_price,2),
                                     'shares': buy_shares, 'buy_cost': round(total_cost,2),
                                     'buy_prob': round(float(buy_probs[i]),4)}
-            elif position is not None and sell_probs[i] >= sell_th:
+            # 卖出条件：概率≥阈值 且 卖概率 > 买概率 + 最小差距
+            elif position is not None and sell_probs[i] >= sell_th and sell_probs[i] > buy_probs[i] + min_gap:
                 revenue = shares * exec_price
                 commission = max(revenue * COMMISSION_RATE, MIN_COMMISSION)
                 stamp_tax = revenue * STAMP_TAX_RATE
@@ -1290,10 +1323,16 @@ def generate_realtime_signal(code, timeframe='daily', is_index=False, model=None
     buy_probs, sell_probs = compute_model_signals(df, model)
     latest = df.iloc[-1]
     lb = float(buy_probs[-1]); ls = float(sell_probs[-1])
+    min_gap = model.get('min_prob_gap', 0.1)
+    buy_th = model['buy_threshold_prob']
+    sell_th = model['sell_threshold_prob']
 
-    if lb >= model['buy_threshold_prob'] and lb > ls:
+    # 信号判定：概率≥阈值 且 高概率方 > 低概率方 + 最小差距
+    # 防止买卖概率同时偏高（信号冲突）
+    conflicting = (lb >= buy_th and ls >= sell_th)  # 两者都超阈值=冲突
+    if lb >= buy_th and lb > ls + min_gap:
         signal = '买入'; strength = lb
-    elif ls >= model['sell_threshold_prob'] and ls > lb:
+    elif ls >= sell_th and ls > lb + min_gap:
         signal = '卖出'; strength = ls
     else:
         signal = '持有'; strength = max(lb, ls)
@@ -1323,16 +1362,24 @@ def generate_realtime_signal(code, timeframe='daily', is_index=False, model=None
     sell_triggered = sum(1 for r in all_sell_indicators if r['triggered'])
 
     # 生成操作建议说明
+    gap = abs(lb - ls)
     if signal == '买入':
-        action_desc = (f"买点概率 {lb*100:.1f}% ≥ 阈值 {model['buy_threshold_prob']*100:.0f}%，"
-                       f"且高于卖点概率 {ls*100:.1f}%。{buy_triggered}/{len(all_buy_indicators)} 个买点指标触发。")
+        action_desc = (f"买点概率 {lb*100:.1f}% ≥ 阈值 {buy_th*100:.0f}%，"
+                       f"且高于卖点概率 {ls*100:.1f}%（差距{gap*100:.1f}% ≥ 最小差距{min_gap*100:.0f}%）。"
+                       f"{buy_triggered}/{len(all_buy_indicators)} 个买点指标触发。")
     elif signal == '卖出':
-        action_desc = (f"卖点概率 {ls*100:.1f}% ≥ 阈值 {model['sell_threshold_prob']*100:.0f}%，"
-                       f"且高于买点概率 {lb*100:.1f}%。{sell_triggered}/{len(all_sell_indicators)} 个卖点指标触发。")
+        action_desc = (f"卖点概率 {ls*100:.1f}% ≥ 阈值 {sell_th*100:.0f}%，"
+                       f"且高于买点概率 {lb*100:.1f}%（差距{gap*100:.1f}% ≥ 最小差距{min_gap*100:.0f}%）。"
+                       f"{sell_triggered}/{len(all_sell_indicators)} 个卖点指标触发。")
     else:
-        action_desc = (f"买点概率 {lb*100:.1f}% / 卖点概率 {ls*100:.1f}%，均未达到阈值"
-                       f"（买≥{model['buy_threshold_prob']*100:.0f}% / 卖≥{model['sell_threshold_prob']*100:.0f}%）。"
-                       f"买{buy_triggered}/{len(all_buy_indicators)}触发，卖{sell_triggered}/{len(all_sell_indicators)}触发。建议观望。")
+        if conflicting:
+            action_desc = (f"⚠️ 信号冲突：买点概率 {lb*100:.1f}% 和卖点概率 {ls*100:.1f}% 均超过阈值，"
+                           f"但差距仅{gap*100:.1f}% < 最小差距{min_gap*100:.0f}%，多空分歧大。"
+                           f"买{buy_triggered}/{len(all_buy_indicators)}触发，卖{sell_triggered}/{len(all_sell_indicators)}触发。建议观望。")
+        else:
+            action_desc = (f"买点概率 {lb*100:.1f}% / 卖点概率 {ls*100:.1f}%，均未达到阈值"
+                           f"（买≥{buy_th*100:.0f}% / 卖≥{sell_th*100:.0f}%，且需差距≥{min_gap*100:.0f}%）。"
+                           f"买{buy_triggered}/{len(all_buy_indicators)}触发，卖{sell_triggered}/{len(all_sell_indicators)}触发。建议观望。")
 
     return {
         'code': code, 'timeframe': timeframe, 'is_index': is_index,
@@ -1341,6 +1388,7 @@ def generate_realtime_signal(code, timeframe='daily', is_index=False, model=None
         'low': round(float(latest['low']),2), 'volume': int(latest['volume']),
         'signal': signal, 'signal_strength': round(strength,4),
         'buy_probability': round(lb,4), 'sell_probability': round(ls,4),
+        'prob_gap': round(gap,4), 'min_prob_gap': min_gap, 'conflicting': conflicting,
         'action_description': action_desc,
         'buy_indicators': all_buy_indicators,
         'sell_indicators': all_sell_indicators,

@@ -18,73 +18,21 @@ import learning
 
 def fetch_capital_flow_akshare(code, start_date, end_date):
     """
-    通过akshare获取个股资金流数据。
+    通过统一多数据源管理器获取个股资金流数据。
+    数据源优先级：AkShare-东财 → efinance-同花顺 → AkShare-新浪
     返回 DataFrame: date, main_net_inflow, super_large_net, large_net,
                      medium_net, small_net, main_net_pct, close
     """
-    import akshare as ak
-
-    # 判断市场
-    if code.startswith(('60', '68', '90', '11', '13', '51', '58')):
-        market = 'sh'
-    else:
-        market = 'sz'
-
-    try:
-        # akshare 个股资金流
-        df = ak.stock_individual_fund_flow(stock=code, market=market)
-        if df is None or len(df) == 0:
-            return pd.DataFrame()
-
-        # 统一列名（akshare不同版本列名可能不同）
-        col_map = {}
-        for col in df.columns:
-            col_lower = str(col).lower()
-            if '日期' in col or 'date' in col_lower:
-                col_map[col] = 'date'
-            elif '主力净流入-净额' in col or ('主力' in col and '净额' in col):
-                col_map[col] = 'main_net_inflow'
-            elif '超大单净流入-净额' in col or ('超大单' in col and '净额' in col):
-                col_map[col] = 'super_large_net'
-            elif '大单净流入-净额' in col or ('大单' in col and '净额' in col):
-                col_map[col] = 'large_net'
-            elif '中单净流入-净额' in col or ('中单' in col and '净额' in col):
-                col_map[col] = 'medium_net'
-            elif '小单净流入-净额' in col or ('小单' in col and '净额' in col):
-                col_map[col] = 'small_net'
-            elif '主力净流入-净占比' in col or ('主力' in col and '占比' in col):
-                col_map[col] = 'main_net_pct'
-            elif '收盘价' in col or ('close' in col_lower and 'net' not in col_lower):
-                col_map[col] = 'close'
-
-        df = df.rename(columns=col_map)
-
-        # 确保必要列存在
-        needed = ['date', 'main_net_inflow']
-        for col in needed:
-            if col not in df.columns:
-                print(f"[资金流] 缺少列: {col}, 可用列: {list(df.columns)}")
-                return pd.DataFrame()
-
-        # 转换数值
-        for col in ['main_net_inflow', 'super_large_net', 'large_net',
-                     'medium_net', 'small_net', 'main_net_pct', 'close']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date').reset_index(drop=True)
-
-        # 按日期过滤
-        mask = (df['date'] >= pd.to_datetime(start_date)) & (df['date'] <= pd.to_datetime(end_date))
-        df = df[mask].reset_index(drop=True)
-
+    import data_sources
+    df = data_sources.fetch_capital_flow(code, start_date, end_date)
+    # 记录数据源状态用于调试
+    status = data_sources.get_source_status()
+    for src, st in status.items():
+        if not st['success']:
+            print(f"[资金流] {src} 失败: {st['detail']}")
+    if len(df) > 0:
         print(f"[资金流] 获取到 {len(df)} 天资金流数据")
-        return df
-
-    except Exception as e:
-        print(f"[资金流] 获取失败: {e}")
-        return pd.DataFrame()
+    return df
 
 
 def estimate_main_force_position(flow_df, df_price, initial_position_pct=0.3):

@@ -1434,6 +1434,19 @@ def run_full_analysis(code, start_date, end_date, timeframe='daily', is_index=Fa
     evaluate_prediction_accuracy._th = model['buy_threshold_prob']
     accuracy = evaluate_prediction_accuracy(df, buy_probs, sell_probs, horizon=5)
 
+    # ============================================================
+    # 模型权重自更新（持续学习：基于回测表现调整指标权重）
+    # ============================================================
+    weight_learning_info = None
+    try:
+        import learning
+        if len(bt_trades) >= 3 and metrics.get('total_trades', 0) >= 3:
+            model = learning.update_model_weights_from_backtest(model, bt_trades, metrics)
+            weight_learning_info = model.get('weight_learning', {})
+            print(f"[持续学习] 模型权重已自更新，调整了{weight_learning_info.get('total_adjustments', 0)}个指标权重")
+    except Exception as e:
+        print(f"[持续学习] 权重自更新失败: {e}")
+
     # K线数据
     step = max(1, len(df) // 800)
     kline_data = []
@@ -1484,6 +1497,7 @@ def run_full_analysis(code, start_date, end_date, timeframe='daily', is_index=Fa
         'model': model, 'probability_curve': prob_curve,
         'equity_curve': equity_curve, 'backtest_trades': bt_trades,
         'metrics': metrics, 'accuracy': accuracy,
+        'weight_learning': weight_learning_info,
         'news_analysis': news_result,
         'capital_flow_analysis': capital_flow_result,
     }

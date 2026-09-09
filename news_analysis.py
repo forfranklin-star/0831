@@ -73,57 +73,17 @@ def classify_news_timing(dt):
 
 def fetch_news_akshare(code, start_date, end_date, max_items=200):
     """
-    通过akshare获取个股新闻和公告。
-    多源尝试：东方财富新闻、公告。
-    返回 DataFrame: date, title, url, source
+    通过统一多数据源管理器获取个股新闻和公告。
+    数据源优先级：AkShare-东财 → efinance-同花顺 → AkShare-新浪 → 巨潮公告
+    返回 DataFrame: date, title, url, source, news_type, timing
     """
-    import akshare as ak
-    all_news = []
-
-    # 源1：东方财富个股新闻
-    try:
-        df_news = ak.stock_news_em(symbol=code)
-        if df_news is not None and len(df_news) > 0:
-            df_news = df_news.rename(columns={'发布时间': 'date', '新闻标题': 'title',
-                                                '新闻链接': 'url', '文章来源': 'source'})
-            for _, row in df_news.iterrows():
-                try:
-                    dt = pd.to_datetime(row['date'])
-                    if pd.to_datetime(start_date) <= dt <= pd.to_datetime(end_date) + timedelta(days=1):
-                        all_news.append({'date': dt, 'title': str(row['title']),
-                                         'url': str(row.get('url', '')), 'source': '东方财富'})
-                except Exception:
-                    continue
-    except Exception as e:
-        print(f"[新闻] 东方财富新闻获取失败: {e}")
-
-    # 源2：巨潮资讯公告（通过akshare）
-    try:
-        # akshare 的公告接口
-        df_notice = ak.stock_notice_report(symbol=code, date=end_date)
-        if df_notice is not None and len(df_notice) > 0:
-            for _, row in df_notice.iterrows():
-                try:
-                    title = str(row.get('公告标题', row.get('标题', '')))
-                    dt_str = str(row.get('公告日期', row.get('日期', '')))
-                    dt = pd.to_datetime(dt_str)
-                    if pd.to_datetime(start_date) <= dt <= pd.to_datetime(end_date) + timedelta(days=1):
-                        all_news.append({'date': dt, 'title': title,
-                                         'url': '', 'source': '巨潮公告'})
-                except Exception:
-                    continue
-    except Exception as e:
-        print(f"[新闻] 公告获取失败: {e}")
-
-    if not all_news:
-        return pd.DataFrame(columns=['date', 'title', 'url', 'source', 'news_type', 'timing'])
-
-    df = pd.DataFrame(all_news)
-    df = df.drop_duplicates(subset=['title']).sort_values('date').reset_index(drop=True)
-    df = df.head(max_items)
-    # 分类
-    df['news_type'] = df['title'].apply(classify_news_type)
-    df['timing'] = df['date'].apply(classify_news_timing)
+    import data_sources
+    df = data_sources.fetch_news(code, start_date, end_date, max_items=max_items)
+    # 记录数据源状态用于调试
+    status = data_sources.get_source_status()
+    for src, st in status.items():
+        if not st['success']:
+            print(f"[新闻] {src} 失败: {st['detail']}")
     return df
 
 

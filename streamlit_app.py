@@ -238,6 +238,39 @@ with st.sidebar:
             st.session_state.current_model = None
             st.rerun()
 
+    # 持续学习数据管理
+    st.markdown("### 🧠 持续学习数据")
+    import learning as _learn
+    learn_summary = _learn.get_learning_summary()
+    st.caption(f"新闻敏感度: {learn_summary['news_sensitivity_entries']}条 | "
+               f"资金流模式: {learn_summary['capital_flow_entries']}条 | "
+               f"仓位跟踪: {learn_summary['position_codes_tracked']}只")
+    le1, le2 = st.columns(2)
+    with le1:
+        import json
+        learn_export = _learn.export_all_learning()
+        learn_json = json.dumps(learn_export, ensure_ascii=False, indent=2, default=str)
+        st.download_button(
+            label="⬇️ 导出学习数据",
+            data=learn_json,
+            file_name=f"learning_data_{datetime.now().strftime('%Y%m%d')}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+    with le2:
+        uploaded_learn = st.file_uploader("⬆️ 导入学习数据", type=['json'], key='learn_import', label_visibility="collapsed")
+        if uploaded_learn is not None:
+            try:
+                imported = json.loads(uploaded_learn.read())
+                result_imp = _learn.import_learning_data(imported, merge=True)
+                if result_imp['success']:
+                    st.success(f"✅ 学习数据导入成功！合并模式")
+                    st.rerun()
+                else:
+                    st.error(f"❌ 导入失败: {result_imp.get('error', '未知错误')}")
+            except Exception as e:
+                st.error(f"❌ 导入失败: {e}")
+
 
 # ============================================================
 # 分析执行
@@ -436,6 +469,43 @@ if result:
             for e in model['sell_eliminated'][:30]:
                 st.markdown(f'<div class="eliminated-item">{e["indicator"]} | r={e["corr"]:.4f} | p={e["pvalue"]:.4f}</div>',
                             unsafe_allow_html=True)
+
+        # 权重自学习状态
+        wl = result.get('weight_learning')
+        if wl and wl.get('total_adjustments', 0) > 0:
+            st.markdown("##### 🧠 模型权重自学习（本次更新）")
+            st.info(f"基于{wl.get('backtest_trades_used', 0)}笔回测交易，学习率{wl.get('learning_rate', 0)}，自动调整了{wl.get('total_adjustments', 0)}个指标权重")
+            adj_df = pd.DataFrame(wl.get('adjustments', []))
+            if len(adj_df) > 0:
+                st.dataframe(adj_df, use_container_width=True, hide_index=True)
+
+        # 模型导出/导入
+        st.markdown("##### 📦 模型导出 / 导入")
+        me1, me2 = st.columns(2)
+        with me1:
+            import json, learning as _learn
+            model_export = _learn.export_model(model)
+            model_json = json.dumps(model_export, ensure_ascii=False, indent=2, default=str)
+            st.download_button(
+                label="⬇️ 导出当前模型到本地",
+                data=model_json,
+                file_name=f"model_{model['name']}_{datetime.now().strftime('%Y%m%d')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        with me2:
+            uploaded_model = st.file_uploader("⬆️ 从本地导入模型", type=['json'], key='model_import')
+            if uploaded_model is not None:
+                try:
+                    imported = json.loads(uploaded_model.read())
+                    imp_model = _learn.import_model(imported)
+                    if imp_model:
+                        st.success(f"✅ 模型「{imp_model['name']}」导入成功！可在下方保存后使用")
+                        st.session_state['imported_model'] = imp_model
+                    else:
+                        st.error("❌ 模型文件格式不正确，缺少必要字段")
+                except Exception as e:
+                    st.error(f"❌ 导入失败: {e}")
 
     with tab5:
         st.warning("⚠️ **样本内回测说明**：本回测的模型规则（指标阈值、权重）是在同一时间段的数据上构建的，属于样本内测试（in-sample），结果可能高估模型实际表现。实盘使用前应进行样本外（out-of-sample）验证或滚动回测。")

@@ -1381,6 +1381,14 @@ def generate_realtime_signal(code, timeframe='daily', is_index=False, model=None
                            f"（买≥{buy_th*100:.0f}% / 卖≥{sell_th*100:.0f}%，且需差距≥{min_gap*100:.0f}%）。"
                            f"买{buy_triggered}/{len(all_buy_indicators)}触发，卖{sell_triggered}/{len(all_sell_indicators)}触发。建议观望。")
 
+    # 波段顶/底概率（无未来函数，基于当前实时指标）
+    swing_state = None
+    try:
+        import swing_detection
+        swing_state = swing_detection.calculate_current_swing_probability(df)
+    except Exception as e:
+        print(f"[实时信号] 波段状态计算失败: {e}")
+
     return {
         'code': code, 'timeframe': timeframe, 'is_index': is_index,
         'date': str(latest['date']), 'close': round(float(latest['close']),2),
@@ -1399,7 +1407,8 @@ def generate_realtime_signal(code, timeframe='daily', is_index=False, model=None
         'key_indicators': all_buy_indicators[:5] + all_sell_indicators[:5],  # 兼容旧字段
         'model_name': model.get('name',''), 'sensitivity': model.get('sensitivity_name',''),
         'model_threshold_buy': model['buy_threshold_prob'],
-        'model_threshold_sell': model['sell_threshold_prob']
+        'model_threshold_sell': model['sell_threshold_prob'],
+        'swing_state': swing_state,
     }
 
 

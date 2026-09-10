@@ -719,4 +719,432 @@ def run_swing_analysis(df, timeframe='daily', holding_days=5):
         'algo_performance': algo_performance,
         'grid_search_top10': params_comparison,
         'holding_days': holding_days,
+        'current_state': calculate_current_swing_probability(df),
     }
+
+
+# ============================================================
+# 当前波段状态识别（无未来函数）
+# ============================================================
+
+def calculate_current_swing_probability(df, lookback=20):
+    """
+    计算当前时刻处于波段顶部/底部的概率（无未来函数，仅用当前和历史数据）。
+
+    纳入12个维度：
+      1. 价格位置（距N日高低点、回撤幅度）
+      2. 当日涨跌幅度（大阳/大阴、连续涨跌天数）
+      3. 波动幅度（当日振幅、ATR、波动率）
+      4. 量能（量比、成交量变化、缩量/放量）
+      5. RSI（超买超卖、偏低偏高档位）
+      6. KDJ（超买超卖、偏低偏高档位）
+      7. MACD（零轴上下、金叉死叉、背离）
+      8. 布林带（触碰上下轨、%b位置、带宽）
+      9. 均线系统（多空排列、乖离率、偏离度）
+      10. CCI/WR/MFI（多指标超买超卖确认）
+      11. PSY心理线（上涨天数比例）
+      12. K线形态（长上影/下影、十字星、吞没）
+
+    返回: dict
+    """
+    if df is None or len(df) < 10:
+        return {
+            'top_probability': 50, 'bottom_probability': 50,
+            'state': '数据不足', 'top_factors': [], 'bottom_factors': [],
+            'top_score': 0, 'bottom_score': 0,
+        }
+
+    df = df.reset_index(drop=True)
+    i = len(df) - 1
+
+    close = _safe_get_swing(df, 'close', i)
+    high = _safe_get_swing(df, 'high', i)
+    low = _safe_get_swing(df, 'low', i)
+    open_p = _safe_get_swing(df, 'open', i)
+    volume = _safe_get_swing(df, 'volume', i)
+    prev_close = _safe_get_swing(df, 'close', i - 1) if i > 0 else close
+
+    if any(pd.isna(x) for x in [close, high, low, open_p]):
+        return {
+            'top_probability': 50, 'bottom_probability': 50,
+            'state': '数据不足', 'top_factors': [], 'bottom_factors': [],
+            'top_score': 0, 'bottom_score': 0,
+        }
+
+    top_score = 0
+    bottom_score = 0
+    top_factors = []
+    bottom_factors = []
+
+    # ============================================================
+    # 1. 价格位置
+    # ============================================================
+    if i >= lookback:
+        recent_high = df['high'].iloc[i - lookback:i + 1].max()
+        recent_low = df['low'].iloc[i - lookback:i + 1].min()
+        if recent_high > 0 and recent_low > 0:
+            dist_to_high = (recent_high - close) / recent_high * 100
+            dist_to_low = (close - recent_low) / recent_low * 100
+            drawdown = (recent_high - close) / recent_high * 100  # 从高点回撤
+            rebound = (close - recent_low) / recent_low * 100  # 从低点反弹
+
+            # 顶部：接近高点
+            if dist_to_high < 2:
+                top_score += 18; top_factors.append(f"接近{lookback}日高点(距{dist_to_high:.1f}%)")
+            elif dist_to_high < 5:
+                top_score += 10; top_factors.append(f"靠近{lookback}日高点(距{dist_to_high:.1f}%)")
+
+            # 底部：接近低点
+            if dist_to_low < 2:
+                bottom_score += 18; bottom_factors.append(f"接近{lookback}日低点(距{dist_to_low:.1f}%)")
+            elif dist_to_low < 5:
+                bottom_score += 10; bottom_factors.append(f"靠近{lookback}日低点(距{dist_to_low:.1f}%)")
+
+            # 顶部：从低点反弹幅度大
+            if rebound > 30:
+                top_score += 10; top_factors.append(f"从低点反弹{rebound:.0f}%(累积涨幅大)")
+            elif rebound > 20:
+                top_score += 5; top_factors.append(f"从低点反弹{rebound:.0f}%")
+
+            # 底部：从高点回撤幅度大
+            if drawdown > 30:
+                bottom_score += 10; bottom_factors.append(f"从高点回撤{drawdown:.0f}%(累积跌幅大)")
+            elif drawdown > 20:
+                bottom_score += 5; bottom_factors.append(f"从高点回撤{drawdown:.0f}%")
+
+    # ============================================================
+    # 2. 当日涨跌幅度 + 连续涨跌
+    # ============================================================
+    if prev_close and prev_close > 0:
+        pct_change = (close - prev_close) / prev_close * 100
+
+        # 大阳线（顶部信号：暴涨后可能见顶）
+        if pct_change > 7:
+            top_score += 12; top_factors.append(f"大阳线(+{pct_change:.1f}%，短期过热)")
+        elif pct_change > 5:
+            top_score += 7; top_factors.append(f"中阳线(+{pct_change:.1f}%)")
+
+        # 大阴线（底部信号：暴跌后可能见底）
+        if pct_change < -7:
+            bottom_score += 12; bottom_factors.append(f"大阴线({pct_change:.1f}%，恐慌抛售)")
+        elif pct_change < -5:
+            bottom_score += 7; bottom_factors.append(f"中阴线({pct_change:.1f}%)")
+
+        # 小阴小阳（顶部滞涨/底部抗跌）
+        if abs(pct_change) < 1:
+            if i >= lookback:
+                recent_high = df['high'].iloc[i - lookback:i].max()
+                recent_low = df['low'].iloc[i - lookback:i].min()
+                if close > recent_high * 0.95:
+                    top_score += 6; top_factors.append(f"高位横盘(涨跌{pct_change:+.1f}%，滞涨)")
+                if close < recent_low * 1.05:
+                    bottom_score += 6; bottom_factors.append(f"低位横盘(涨跌{pct_change:+.1f}%，抗跌)")
+
+    # 连续涨跌天数
+    if i >= 5:
+        up_days = sum(1 for j in range(i - 4, i + 1) if df.iloc[j]['close'] > df.iloc[j - 1]['close'])
+        down_days = 5 - up_days
+        if up_days >= 4:
+            top_score += 8; top_factors.append(f"连续上涨({up_days}/5日，多头过热)")
+        if down_days >= 4:
+            bottom_score += 8; bottom_factors.append(f"连续下跌({down_days}/5日，空头衰竭)")
+
+    # ============================================================
+    # 3. 波动幅度
+    # ============================================================
+    if prev_close and prev_close > 0:
+        amplitude = (high - low) / prev_close * 100  # 当日振幅
+        if amplitude > 8:
+            top_score += 6; top_factors.append(f"高振幅({amplitude:.1f}%，多空分歧大)")
+            bottom_score += 4; bottom_factors.append(f"高振幅({amplitude:.1f}%，可能探底)")
+        elif amplitude > 5:
+            top_score += 3; top_factors.append(f"振幅较大({amplitude:.1f}%)")
+
+    # ATR（平均真实波幅）
+    atr = _safe_get_swing(df, 'ATR14', i)
+    if pd.notna(atr) and prev_close and prev_close > 0:
+        atr_pct = atr / prev_close * 100
+        if atr_pct > 6:
+            top_score += 4; top_factors.append(f"ATR高({atr_pct:.1f}%，波动率放大)")
+
+    # ============================================================
+    # 4. 量能
+    # ============================================================
+    if pd.notna(volume) and i >= 5:
+        avg_vol5 = df['volume'].iloc[i - 5:i].mean()
+        if avg_vol5 > 0:
+            vol_ratio = volume / avg_vol5
+            pct_change = (close - prev_close) / prev_close * 100 if prev_close and prev_close > 0 else 0
+
+            # 放量滞涨（顶部）
+            if vol_ratio > 2 and 0 <= pct_change < 2:
+                top_score += 15; top_factors.append(f"放量滞涨(量比{vol_ratio:.1f}，涨{pct_change:.1f}%)")
+            elif vol_ratio > 1.5 and abs(pct_change) < 1:
+                if pct_change >= 0:
+                    top_score += 10; top_factors.append(f"放量滞涨(量比{vol_ratio:.1f})")
+                else:
+                    bottom_score += 10; bottom_factors.append(f"放量抗跌(量比{vol_ratio:.1f})")
+
+            # 放量大跌（底部：恐慌抛售）
+            if vol_ratio > 1.5 and pct_change < -3:
+                bottom_score += 8; bottom_factors.append(f"放量大跌(量比{vol_ratio:.1f}，跌{pct_change:.1f}%，恐慌盘)")
+
+            # 缩量下跌（底部：抛压衰竭）
+            if vol_ratio < 0.7 and pct_change < 0:
+                bottom_score += 8; bottom_factors.append(f"缩量下跌(量比{vol_ratio:.1f}，抛压衰竭)")
+
+            # 缩量上涨（顶部：买盘不足）
+            if vol_ratio < 0.7 and pct_change > 0:
+                top_score += 6; top_factors.append(f"缩量上涨(量比{vol_ratio:.1f}，买盘不足)")
+
+    # ============================================================
+    # 5. RSI
+    # ============================================================
+    rsi = _safe_get_swing(df, 'RSI14', i) or _safe_get_swing(df, 'RSI_14', i)
+    if pd.notna(rsi):
+        if rsi > 80:
+            top_score += 18; top_factors.append(f"RSI严重超买({rsi:.1f})")
+        elif rsi > 70:
+            top_score += 12; top_factors.append(f"RSI超买({rsi:.1f})")
+        elif rsi > 60:
+            top_score += 5; top_factors.append(f"RSI偏高({rsi:.1f})")
+
+        if rsi < 20:
+            bottom_score += 18; bottom_factors.append(f"RSI严重超卖({rsi:.1f})")
+        elif rsi < 30:
+            bottom_score += 12; bottom_factors.append(f"RSI超卖({rsi:.1f})")
+        elif rsi < 40:
+            bottom_score += 5; bottom_factors.append(f"RSI偏低({rsi:.1f})")
+
+    # ============================================================
+    # 6. KDJ
+    # ============================================================
+    kdj_k = _safe_get_swing(df, 'K', i) or _safe_get_swing(df, 'KDJ_K', i)
+    if pd.notna(kdj_k):
+        if kdj_k > 90:
+            top_score += 15; top_factors.append(f"KDJ严重超买(K={kdj_k:.1f})")
+        elif kdj_k > 80:
+            top_score += 10; top_factors.append(f"KDJ超买(K={kdj_k:.1f})")
+        elif kdj_k > 70:
+            top_score += 5; top_factors.append(f"KDJ偏高(K={kdj_k:.1f})")
+
+        if kdj_k < 10:
+            bottom_score += 15; bottom_factors.append(f"KDJ严重超卖(K={kdj_k:.1f})")
+        elif kdj_k < 20:
+            bottom_score += 10; bottom_factors.append(f"KDJ超卖(K={kdj_k:.1f})")
+        elif kdj_k < 30:
+            bottom_score += 5; bottom_factors.append(f"KDJ偏低(K={kdj_k:.1f})")
+
+    # ============================================================
+    # 7. MACD
+    # ============================================================
+    dif = _safe_get_swing(df, 'DIF', i) or _safe_get_swing(df, 'MACD_DIF', i)
+    dea = _safe_get_swing(df, 'DEA', i) or _safe_get_swing(df, 'MACD_DEA', i)
+    dif_prev = _safe_get_swing(df, 'DIF', i - 1) or _safe_get_swing(df, 'MACD_DIF', i - 1)
+    if pd.notna(dif):
+        # 零轴上方且走弱（顶部）
+        if dif > 0 and pd.notna(dif_prev) and dif < dif_prev:
+            top_score += 10; top_factors.append(f"MACD高位走弱(DIF={dif:.2f})")
+        # 零轴下方且走强（底部）
+        if dif < 0 and pd.notna(dif_prev) and dif > dif_prev:
+            bottom_score += 10; bottom_factors.append(f"MACD低位走强(DIF={dif:.2f})")
+        # 死叉（顶部）
+        if pd.notna(dea) and pd.notna(dif_prev):
+            dea_prev = _safe_get_swing(df, 'DEA', i - 1) or _safe_get_swing(df, 'MACD_DEA', i - 1)
+            if pd.notna(dea_prev) and dif_prev >= dea_prev and dif < dea:
+                top_score += 8; top_factors.append("MACD死叉")
+            if pd.notna(dea_prev) and dif_prev <= dea_prev and dif > dea:
+                bottom_score += 8; bottom_factors.append("MACD金叉")
+
+    # ============================================================
+    # 8. 布林带
+    # ============================================================
+    boll_up = _safe_get_swing(df, 'BOLL_UP', i) or _safe_get_swing(df, 'BOLL_UPPER', i)
+    boll_low = _safe_get_swing(df, 'BOLL_LOW', i) or _safe_get_swing(df, 'BOLL_LOWER', i)
+    boll_mid = _safe_get_swing(df, 'BOLL_MID', i)
+    pctb = _safe_get_swing(df, 'BOLL_PCTB', i)
+
+    if pd.notna(boll_up) and close >= boll_up * 0.98:
+        top_score += 12; top_factors.append(f"触碰布林上轨(收盘{close:.2f})")
+    if pd.notna(boll_low) and close <= boll_low * 1.02:
+        bottom_score += 12; bottom_factors.append(f"触碰布林下轨(收盘{close:.2f})")
+
+    # 布林%b位置
+    if pd.notna(pctb):
+        if pctb > 0.9:
+            top_score += 8; top_factors.append(f"布林%b极高({pctb:.2f})")
+        elif pctb > 0.8:
+            top_score += 4; top_factors.append(f"布林%b偏高({pctb:.2f})")
+        if pctb < 0.1:
+            bottom_score += 8; bottom_factors.append(f"布林%b极低({pctb:.2f})")
+        elif pctb < 0.2:
+            bottom_score += 4; bottom_factors.append(f"布林%b偏低({pctb:.2f})")
+
+    # ============================================================
+    # 9. 均线系统
+    # ============================================================
+    ma5 = _safe_get_swing(df, 'MA5', i)
+    ma10 = _safe_get_swing(df, 'MA10', i)
+    ma20 = _safe_get_swing(df, 'MA20', i)
+    ma60 = _safe_get_swing(df, 'MA60', i)
+
+    # 多头排列（顶部风险）
+    if all(pd.notna(x) for x in [ma5, ma10, ma20]) and ma5 > ma10 > ma20:
+        if ma20 and ma20 > 0 and (close - ma20) / ma20 * 100 > 20:
+            top_score += 10; top_factors.append(f"多头排列+偏离MA20过远(+{(close-ma20)/ma20*100:.1f}%)")
+        elif ma20 and ma20 > 0 and (close - ma20) / ma20 * 100 > 10:
+            top_score += 5; top_factors.append(f"多头排列+偏离MA20(+{(close-ma20)/ma20*100:.1f}%)")
+
+    # 空头排列（底部机会）
+    if all(pd.notna(x) for x in [ma5, ma10, ma20]) and ma5 < ma10 < ma20:
+        if ma20 and ma20 > 0 and (ma20 - close) / ma20 * 100 > 20:
+            bottom_score += 10; bottom_factors.append(f"空头排列+偏离MA20过远(-{(ma20-close)/ma20*100:.1f}%)")
+        elif ma20 and ma20 > 0 and (ma20 - close) / ma20 * 100 > 10:
+            bottom_score += 5; bottom_factors.append(f"空头排列+偏离MA20(-{(ma20-close)/ma20*100:.1f}%)")
+
+    # 乖离率BIAS
+    bias20 = _safe_get_swing(df, 'BIAS20', i)
+    if pd.notna(bias20):
+        if bias20 > 15:
+            top_score += 8; top_factors.append(f"BIAS20过高({bias20:.1f}%)")
+        elif bias20 > 10:
+            top_score += 4; top_factors.append(f"BIAS20偏高({bias20:.1f}%)")
+        if bias20 < -15:
+            bottom_score += 8; bottom_factors.append(f"BIAS20过低({bias20:.1f}%)")
+        elif bias20 < -10:
+            bottom_score += 4; bottom_factors.append(f"BIAS20偏低({bias20:.1f}%)")
+
+    # ============================================================
+    # 10. CCI / WR / MFI 多指标确认
+    # ============================================================
+    cci = _safe_get_swing(df, 'CCI', i)
+    if pd.notna(cci):
+        if cci > 200:
+            top_score += 10; top_factors.append(f"CCI严重超买({cci:.0f})")
+        elif cci > 100:
+            top_score += 6; top_factors.append(f"CCI超买({cci:.0f})")
+        if cci < -200:
+            bottom_score += 10; bottom_factors.append(f"CCI严重超卖({cci:.0f})")
+        elif cci < -100:
+            bottom_score += 6; bottom_factors.append(f"CCI超卖({cci:.0f})")
+
+    wr = _safe_get_swing(df, 'WR', i)
+    if pd.notna(wr):
+        if wr < -80:
+            bottom_score += 8; bottom_factors.append(f"WR超卖({wr:.0f})")
+        elif wr < -60:
+            bottom_score += 4; bottom_factors.append(f"WR偏低({wr:.0f})")
+        if wr > -20:
+            top_score += 8; top_factors.append(f"WR超买({wr:.0f})")
+        elif wr > -40:
+            top_score += 4; top_factors.append(f"WR偏高({wr:.0f})")
+
+    mfi = _safe_get_swing(df, 'MFI14', i)
+    if pd.notna(mfi):
+        if mfi > 80:
+            top_score += 10; top_factors.append(f"MFI超买({mfi:.1f}，资金过热)")
+        elif mfi > 70:
+            top_score += 5; top_factors.append(f"MFI偏高({mfi:.1f})")
+        if mfi < 20:
+            bottom_score += 10; bottom_factors.append(f"MFI超卖({mfi:.1f}，资金枯竭)")
+        elif mfi < 30:
+            bottom_score += 5; bottom_factors.append(f"MFI偏低({mfi:.1f})")
+
+    # ============================================================
+    # 11. PSY心理线
+    # ============================================================
+    psy = _safe_get_swing(df, 'PSY12', i)
+    if pd.notna(psy):
+        if psy > 75:
+            top_score += 8; top_factors.append(f"PSY过高({psy:.0f}，市场情绪过热)")
+        elif psy > 65:
+            top_score += 4; top_factors.append(f"PSY偏高({psy:.0f})")
+        if psy < 25:
+            bottom_score += 8; bottom_factors.append(f"PSY过低({psy:.0f}，市场情绪冰点)")
+        elif psy < 35:
+            bottom_score += 4; bottom_factors.append(f"PSY偏低({psy:.0f})")
+
+    # ============================================================
+    # 12. K线形态
+    # ============================================================
+    body = abs(close - open_p)
+    if body > 0:
+        upper_shadow = (high - max(close, open_p)) / body
+        lower_shadow = (min(close, open_p) - low) / body
+
+        if upper_shadow > 3:
+            top_score += 12; top_factors.append(f"极长上影线(上影/实体={upper_shadow:.1f}，抛压重)")
+        elif upper_shadow > 2:
+            top_score += 7; top_factors.append(f"长上影线(上影/实体={upper_shadow:.1f})")
+
+        if lower_shadow > 3:
+            bottom_score += 12; bottom_factors.append(f"极长下影线(下影/实体={lower_shadow:.1f}，承接强)")
+        elif lower_shadow > 2:
+            bottom_score += 7; bottom_factors.append(f"长下影线(下影/实体={lower_shadow:.1f})")
+
+    # 十字星（高位十字星见顶，低位十字星见底）
+    if body > 0 and body / close < 0.005:
+        if i >= lookback:
+            recent_high = df['high'].iloc[i - lookback:i].max()
+            recent_low = df['low'].iloc[i - lookback:i].min()
+            if close > recent_high * 0.9:
+                top_score += 6; top_factors.append("高位十字星(变盘信号)")
+            if close < recent_low * 1.1:
+                bottom_score += 6; bottom_factors.append("低位十字星(变盘信号)")
+
+    # ============================================================
+    # 归一化与状态判断
+    # ============================================================
+    max_score = 180  # 理论最高分约180（12个维度）
+    top_prob = min(top_score / max_score * 100, 100)
+    bottom_prob = min(bottom_score / max_score * 100, 100)
+
+    if top_prob >= 45 and top_prob > bottom_prob:
+        state = '顶部区域（注意回调风险）'
+    elif bottom_prob >= 45 and bottom_prob > top_prob:
+        state = '底部区域（关注反弹机会）'
+    elif top_prob > bottom_prob + 12:
+        state = '偏顶部（谨慎追高）'
+    elif bottom_prob > top_prob + 12:
+        state = '偏底部（可考虑低吸）'
+    else:
+        if all(pd.notna(x) for x in [ma5, ma20]) and ma5 > ma20:
+            state = '上升趋势中（持有为主）'
+        elif all(pd.notna(x) for x in [ma5, ma20]) and ma5 < ma20:
+            state = '下降趋势中（观望为主）'
+        else:
+            state = '震荡整理（方向不明）'
+
+    return {
+        'top_probability': round(top_prob, 1),
+        'bottom_probability': round(bottom_prob, 1),
+        'state': state,
+        'top_factors': top_factors,
+        'bottom_factors': bottom_factors,
+        'top_score': round(top_score, 1),
+        'bottom_score': round(bottom_score, 1),
+        'current_price': round(close, 2),
+        'current_date': str(df.iloc[i]['date'])[:10],
+        'dimensions': {
+            'price_position': '价格位置',
+            'price_change': '涨跌幅度',
+            'volatility': '波动幅度',
+            'volume': '量能',
+            'rsi': 'RSI',
+            'kdj': 'KDJ',
+            'macd': 'MACD',
+            'bollinger': '布林带',
+            'ma': '均线系统',
+            'cci_wr_mfi': 'CCI/WR/MFI',
+            'psy': 'PSY心理线',
+            'candlestick': 'K线形态',
+        }
+    }
+
+
+def _safe_get_swing(df, col, idx, default=np.nan):
+    """安全获取DataFrame某列某行的值"""
+    if col in df.columns and 0 <= idx < len(df):
+        val = df.iloc[idx][col]
+        return val if pd.notna(val) else default
+    return default

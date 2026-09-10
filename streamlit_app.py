@@ -997,6 +997,52 @@ if st.session_state.signal_result:
         info3.caption(f"**模型**: {sig.get('model_name', '自动构建')}")
         info4.caption(f"**收盘价**: ¥{sig['close']} | 量: {sig['volume']:,}")
 
+    # 波段顶/底概率（无未来函数）
+    swing = sig.get('swing_state')
+    if swing:
+        st.markdown("")
+        st.markdown("##### 📐 波段顶/底概率（实时，无未来函数）")
+        sw1, sw2, sw3 = st.columns([1, 1, 2])
+        with sw1:
+            top_pct = swing['top_probability']
+            top_color = '#c62828' if top_pct > 50 else ('#ef6c00' if top_pct > 30 else '#666')
+            st.markdown(f"""
+            <div style="background:#fff3e0;padding:12px;border-radius:8px;text-align:center;border-left:4px solid {top_color};">
+                <div style="font-size:11px;color:#888;">波段顶部概率</div>
+                <div style="font-size:24px;font-weight:700;color:{top_color};">{top_pct:.1f}%</div>
+            </div>""", unsafe_allow_html=True)
+        with sw2:
+            bot_pct = swing['bottom_probability']
+            bot_color = '#2e7d32' if bot_pct > 50 else ('#558b2f' if bot_pct > 30 else '#666')
+            st.markdown(f"""
+            <div style="background:#e8f5e9;padding:12px;border-radius:8px;text-align:center;border-left:4px solid {bot_color};">
+                <div style="font-size:11px;color:#888;">波段底部概率</div>
+                <div style="font-size:24px;font-weight:700;color:{bot_color};">{bot_pct:.1f}%</div>
+            </div>""", unsafe_allow_html=True)
+        with sw3:
+            st.markdown(f"""
+            <div style="background:#f5f5f5;padding:12px 16px;border-radius:8px;">
+                <div style="font-size:12px;color:#888;margin-bottom:4px;">当前波段状态</div>
+                <div style="font-size:15px;font-weight:600;color:#333;">{swing['state']}</div>
+                <div style="font-size:11px;color:#888;margin-top:4px;">
+                    基于价格位置/RSI/KDJ/MACD/布林/量价/K线形态/均线8维度实时打分
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+        # 触发因素
+        if swing.get('top_factors') or swing.get('bottom_factors'):
+            fcol1, fcol2 = st.columns(2)
+            with fcol1:
+                if swing.get('top_factors'):
+                    st.markdown("###### 🔴 顶部触发因素")
+                    for f in swing['top_factors']:
+                        st.markdown(f"- {f}")
+            with fcol2:
+                if swing.get('bottom_factors'):
+                    st.markdown("###### 🟢 底部触发因素")
+                    for f in swing['bottom_factors']:
+                        st.markdown(f"- {f}")
+
     st.markdown("")
 
     # 底部：全部买点指标 + 全部卖点指标

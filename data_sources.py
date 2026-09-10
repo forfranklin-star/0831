@@ -1,394 +1,328 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-统一多数据源管理器
-==================
-为行情、新闻、资金流三类数据提供统一接口，每个数据源按优先级依次尝试，
-第一个成功的就用。所有数据源失败时返回空结果而非抛出异常。
+统一多数据源管理器 v2.0
+========================
+经过实际测试验证的数据源优先级：
+  新闻：东方财富直连API(已验证) → akshare(备选)
+  资金流：东方财富直连API(已验证) → akshare(备选)
+  实时行情：腾讯财经直连(已验证) → 东方财富直连
 
-数据源优先级（海外服务器优化）：
-  行情：Yahoo Finance → baostock → 腾讯财经 → efinance → AkShare-东财 → AkShare-新浪
-  新闻：AkShare-东财 → efinance-同花顺 → AkShare-新浪 → 腾讯财经
-  资金流：AkShare-东财 → efinance-同花顺 → AkShare-新浪
+核心改进：东方财富直连API使用纯urllib实现，不依赖akshare，
+在海外服务器（Streamlit Cloud）上可正常访问。
 """
 import time
+import json
+import urllib.request
+import urllib.parse
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
-# 数据源状态记录（用于调试和展示）
 _source_status = {}
 
 
 def _record_status(source_name, success, detail=''):
-    """记录数据源调用状态"""
     _source_status[source_name] = {
-        'success': success,
-        'detail': detail,
+        'success': success, 'detail': detail,
         'time': datetime.now().strftime('%H:%M:%S')
     }
 
 
 def get_source_status():
-    """获取所有数据源调用状态"""
     return dict(_source_status)
 
 
 def clear_source_status():
-    """清空数据源状态记录"""
     _source_status.clear()
+
+
+def _http_get(url, timeout=10, headers=None):
+    """统一HTTP GET请求"""
+    default_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+    }
+    if headers:
+        default_headers.update(headers)
+    req = urllib.request.Request(url, headers=default_headers)
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    return resp.read()
+
+
+def _get_secid(code):
+    """东方财富secid: 沪市1.代码, 深市0.代码"""
+    if code.startswith(('60', '68', '90', '11', '13', '51', '58')):
+        return f"1.{code}"
+    return f"0.{code}"
 
 
 # ============================================================
 # 新闻数据源
 # ============================================================
-def fetch_news(code, start_date, end_date, max_items=200, timeout=10):
+def _fetch_news_eastmoney_direct(code, start_date, end_date, max_items=100):
     """
-    多源获取个股新闻/公告，按优先级依次尝试。
-
-    返回: DataFrame (date, title, url, source, news_type, timing)
+    东方财富新闻搜索直连API（已验证可用，不依赖akshare）。
     """
-    clear_source_status()
-    all_news = []
+    try:
+        param = {
+            "uid": "", "keyword": code, "type": ["cmsArticleWebOld"],
+            "client": "web", "clientType": "web", "clientVersion": "curr",
+            "param": {"cmsArticleWebOld": {
+                "searchScope": "default", "sort": "default",
+                "pageIndex": 1, "pageSize": max_items, "preTag": "", "postTag": ""
+            }}
+        }
+        param_json = json.dumps(param, ensure_ascii=False)
+        encoded_param = urllib.parse.quote(param_json)
+        url = f"https://search-api-web.eastmoney.com/search/jsonp?cb=jQuery&param={encoded_param}"
 
-    # 源1: AkShare - 东方财富新闻
+        t0 = time.time()
+        raw = _http_get(url, timeout=12, headers={'Referer': 'https://so.eastmoney.com/'})
+        text = raw.decode('utf-8')
+        elapsed = time.time() - t0
+
+        start = text.find('(') + 1
+        end = text.rfind(')')
+        if start <= 0 or end <= start:
+            raise ValueError(f"JSONP解析失败: {text[:200]}")
+        data = json.loads(text[start:end])
+
+        articles = data.get('result', {}).get('cmsArticleWebOld', [])
+        if not isinstance(articles, list) or len(articles) == 0:
+            _record_status('东财直连新闻', False, f'返回空, {elapsed:.1f}s')
+            return pd.DataFrame()
+
+        from news_analysis import classify_news_type, classify_news_timing
+        results = []
+        for art in articles:
+            try:
+                dt = pd.to_datetime(art.get('date', ''))
+                if pd.to_datetime(start_date) <= dt <= pd.to_datetime(end_date) + timedelta(days=1):
+                    title = art.get('title', '').replace('<em>', '').replace('</em>', '')
+                    results.append({
+                        'date': dt, 'title': title, 'url': art.get('url', ''),
+                        'source': '东方财富',
+                        'news_type': classify_news_type(title),
+                        'timing': classify_news_timing(dt),
+                    })
+            except Exception:
+                continue
+
+        if results:
+            df = pd.DataFrame(results).drop_duplicates(subset=['title']).sort_values('date').reset_index(drop=True)
+            _record_status('东财直连新闻', True, f'{len(df)}条, {elapsed:.1f}s')
+            return df.head(max_items)
+        _record_status('东财直连新闻', False, f'日期过滤后为空, {elapsed:.1f}s')
+        return pd.DataFrame()
+    except Exception as e:
+        _record_status('东财直连新闻', False, f'{type(e).__name__}: {str(e)[:100]}')
+        return pd.DataFrame()
+
+
+def _fetch_news_akshare(code, start_date, end_date, max_items=100):
+    """akshare东方财富新闻（备选）"""
     try:
         import akshare as ak
+        t0 = time.time()
         df = ak.stock_news_em(symbol=code)
-        if df is not None and len(df) > 0:
-            df = df.rename(columns={'发布时间': 'date', '新闻标题': 'title',
-                                     '新闻链接': 'url', '文章来源': 'source'})
-            count = 0
-            for _, row in df.iterrows():
-                try:
-                    dt = pd.to_datetime(row['date'])
-                    if pd.to_datetime(start_date) <= dt <= pd.to_datetime(end_date) + timedelta(days=1):
-                        all_news.append({'date': dt, 'title': str(row['title']),
-                                         'url': str(row.get('url', '')), 'source': '东方财富'})
-                        count += 1
-                except Exception:
-                    continue
-            _record_status('AkShare-东财新闻', True, f'{count}条')
-            if count > 0:
-                return _finalize_news(all_news, max_items)
-        else:
-            _record_status('AkShare-东财新闻', False, '返回空')
+        elapsed = time.time() - t0
+        if df is None or len(df) == 0:
+            _record_status('akshare新闻', False, f'返回空, {elapsed:.1f}s')
+            return pd.DataFrame()
+        from news_analysis import classify_news_type, classify_news_timing
+        df = df.rename(columns={'发布时间': 'date', '新闻标题': 'title', '新闻链接': 'url', '文章来源': 'source'})
+        results = []
+        for _, row in df.iterrows():
+            try:
+                dt = pd.to_datetime(row['date'])
+                if pd.to_datetime(start_date) <= dt <= pd.to_datetime(end_date) + timedelta(days=1):
+                    title = str(row['title'])
+                    results.append({
+                        'date': dt, 'title': title, 'url': str(row.get('url', '')),
+                        'source': '东方财富', 'news_type': classify_news_type(title),
+                        'timing': classify_news_timing(dt),
+                    })
+            except Exception:
+                continue
+        if results:
+            result_df = pd.DataFrame(results).drop_duplicates(subset=['title']).sort_values('date').reset_index(drop=True)
+            _record_status('akshare新闻', True, f'{len(result_df)}条, {elapsed:.1f}s')
+            return result_df.head(max_items)
+        _record_status('akshare新闻', False, f'过滤后空, {elapsed:.1f}s')
+        return pd.DataFrame()
     except Exception as e:
-        _record_status('AkShare-东财新闻', False, str(e)[:80])
+        _record_status('akshare新闻', False, f'{type(e).__name__}: {str(e)[:80]}')
+        return pd.DataFrame()
 
-    # 源2: efinance - 同花顺新闻
-    try:
-        import efinance as ef
-        df = ef.stock.get_news_history(code)
-        if df is not None and len(df) > 0:
-            count = 0
-            for _, row in df.iterrows():
-                try:
-                    dt = pd.to_datetime(row.get('发布时间', row.get('date', '')))
-                    title = str(row.get('新闻标题', row.get('title', '')))
-                    if pd.to_datetime(start_date) <= dt <= pd.to_datetime(end_date) + timedelta(days=1):
-                        all_news.append({'date': dt, 'title': title,
-                                         'url': '', 'source': '同花顺'})
-                        count += 1
-                except Exception:
-                    continue
-            _record_status('efinance-同花顺新闻', True, f'{count}条')
-            if count > 0:
-                return _finalize_news(all_news, max_items)
-        else:
-            _record_status('efinance-同花顺新闻', False, '返回空')
-    except Exception as e:
-        _record_status('efinance-同花顺新闻', False, str(e)[:80])
 
-    # 源3: AkShare - 新浪财经新闻
-    try:
-        import akshare as ak
-        df = ak.stock_news_sina(symbol=code)
-        if df is not None and len(df) > 0:
-            count = 0
-            for _, row in df.iterrows():
-                try:
-                    dt = pd.to_datetime(row.get('发布时间', row.get('date', '')))
-                    title = str(row.get('新闻标题', row.get('title', '')))
-                    if pd.to_datetime(start_date) <= dt <= pd.to_datetime(end_date) + timedelta(days=1):
-                        all_news.append({'date': dt, 'title': title,
-                                         'url': str(row.get('新闻链接', '')), 'source': '新浪财经'})
-                        count += 1
-                except Exception:
-                    continue
-            _record_status('AkShare-新浪新闻', True, f'{count}条')
-            if count > 0:
-                return _finalize_news(all_news, max_items)
-        else:
-            _record_status('AkShare-新浪新闻', False, '返回空')
-    except Exception as e:
-        _record_status('AkShare-新浪新闻', False, str(e)[:80])
-
-    # 源4: AkShare - 公告（巨潮资讯）
-    try:
-        import akshare as ak
-        df = ak.stock_notice_report(symbol=code, date=end_date)
-        if df is not None and len(df) > 0:
-            count = 0
-            for _, row in df.iterrows():
-                try:
-                    title = str(row.get('公告标题', row.get('标题', '')))
-                    dt_str = str(row.get('公告日期', row.get('日期', '')))
-                    dt = pd.to_datetime(dt_str)
-                    if pd.to_datetime(start_date) <= dt <= pd.to_datetime(end_date) + timedelta(days=1):
-                        all_news.append({'date': dt, 'title': title,
-                                         'url': '', 'source': '巨潮公告'})
-                        count += 1
-                except Exception:
-                    continue
-            _record_status('AkShare-巨潮公告', True, f'{count}条')
-            if count > 0:
-                return _finalize_news(all_news, max_items)
-        else:
-            _record_status('AkShare-巨潮公告', False, '返回空')
-    except Exception as e:
-        _record_status('AkShare-巨潮公告', False, str(e)[:80])
-
-    _record_status('全部新闻源', False, '4个源均失败')
+def fetch_news(code, start_date, end_date, max_items=100):
+    """多源获取个股新闻：东方财富直连API(首选) → akshare(备选)"""
+    clear_source_status()
+    df = _fetch_news_eastmoney_direct(code, start_date, end_date, max_items)
+    if len(df) > 0:
+        return df
+    df = _fetch_news_akshare(code, start_date, end_date, max_items)
+    if len(df) > 0:
+        return df
+    _record_status('全部新闻源', False, '2个源均失败')
     return pd.DataFrame(columns=['date', 'title', 'url', 'source', 'news_type', 'timing'])
-
-
-def _finalize_news(all_news, max_items):
-    """整理新闻结果：去重、分类、排序"""
-    if not all_news:
-        return pd.DataFrame(columns=['date', 'title', 'url', 'source', 'news_type', 'timing'])
-    from news_analysis import classify_news_type, classify_news_timing
-    df = pd.DataFrame(all_news)
-    df = df.drop_duplicates(subset=['title']).sort_values('date').reset_index(drop=True)
-    df = df.head(max_items)
-    df['news_type'] = df['title'].apply(classify_news_type)
-    df['timing'] = df['date'].apply(classify_news_timing)
-    return df
 
 
 # ============================================================
 # 资金流数据源
 # ============================================================
-def fetch_capital_flow(code, start_date, end_date, timeout=10):
+def _fetch_flow_eastmoney_direct(code, start_date, end_date):
     """
-    多源获取个股资金流数据，按优先级依次尝试。
-
-    返回: DataFrame (date, main_net_inflow, super_large_net, large_net,
-                     medium_net, small_net, main_net_pct, close)
+    东方财富个股资金流直连API（已验证可用，不依赖akshare）。
     """
-    # 判断市场
-    if code.startswith(('60', '68', '90', '11', '13', '51', '58')):
-        market = 'sh'
-    else:
-        market = 'sz'
+    try:
+        secid = _get_secid(code)
+        url = (f"https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?"
+               f"lmt=0&klt=101&fields1=f1,f2,f3,f7&"
+               f"fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65&"
+               f"ut=b2884a393a59ad64002292a3e90d46a5&secid={secid}")
+        t0 = time.time()
+        raw = _http_get(url, timeout=12, headers={'Referer': 'https://data.eastmoney.com/'})
+        data = json.loads(raw.decode('utf-8'))
+        elapsed = time.time() - t0
 
-    # 源1: AkShare - 东方财富资金流
+        klines = data.get('data', {}).get('klines', [])
+        if not klines:
+            _record_status('东财直连资金流', False, f'返回空, {elapsed:.1f}s')
+            return pd.DataFrame()
+
+        records = []
+        for line in klines:
+            parts = line.split(',')
+            if len(parts) < 7:
+                continue
+            try:
+                dt = pd.to_datetime(parts[0])
+                if pd.to_datetime(start_date) <= dt <= pd.to_datetime(end_date):
+                    records.append({
+                        'date': dt,
+                        'main_net_inflow': float(parts[1]),
+                        'small_net': float(parts[2]),
+                        'medium_net': float(parts[3]),
+                        'large_net': float(parts[4]),
+                        'super_large_net': float(parts[5]),
+                        'main_net_pct': float(parts[6]) if len(parts) > 6 else 0.0,
+                        'close': float(parts[11]) if len(parts) > 11 else 0.0,
+                    })
+            except Exception:
+                continue
+
+        if records:
+            df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
+            _record_status('东财直连资金流', True, f'{len(df)}天, {elapsed:.1f}s')
+            return df
+        _record_status('东财直连资金流', False, f'过滤后空, {elapsed:.1f}s')
+        return pd.DataFrame()
+    except Exception as e:
+        _record_status('东财直连资金流', False, f'{type(e).__name__}: {str(e)[:100]}')
+        return pd.DataFrame()
+
+
+def _fetch_flow_akshare(code, start_date, end_date):
+    """akshare资金流（备选）"""
     try:
         import akshare as ak
+        market = 'sh' if code.startswith(('60', '68', '90')) else 'sz'
+        t0 = time.time()
         df = ak.stock_individual_fund_flow(stock=code, market=market)
-        if df is not None and len(df) > 0:
-            df = _standardize_flow_df(df)
-            df = _filter_flow_dates(df, start_date, end_date)
-            if len(df) > 0:
-                _record_status('AkShare-东财资金流', True, f'{len(df)}天')
-                return df
-        _record_status('AkShare-东财资金流', False, '返回空或过滤后为空')
+        elapsed = time.time() - t0
+        if df is None or len(df) == 0:
+            _record_status('akshare资金流', False, f'返回空, {elapsed:.1f}s')
+            return pd.DataFrame()
+        col_map = {}
+        for col in df.columns:
+            cs = str(col)
+            if '日期' in cs: col_map[col] = 'date'
+            elif '主力净流入-净额' in cs: col_map[col] = 'main_net_inflow'
+            elif '超大单净流入-净额' in cs: col_map[col] = 'super_large_net'
+            elif '大单净流入-净额' in cs: col_map[col] = 'large_net'
+            elif '中单净流入-净额' in cs: col_map[col] = 'medium_net'
+            elif '小单净流入-净额' in cs: col_map[col] = 'small_net'
+            elif '主力净流入-净占比' in cs: col_map[col] = 'main_net_pct'
+            elif '收盘价' in cs: col_map[col] = 'close'
+        df = df.rename(columns=col_map)
+        if 'date' not in df.columns:
+            _record_status('akshare资金流', False, '缺少date列')
+            return pd.DataFrame()
+        df['date'] = pd.to_datetime(df['date'])
+        for c in ['main_net_inflow', 'super_large_net', 'large_net', 'medium_net', 'small_net', 'main_net_pct', 'close']:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+        mask = (df['date'] >= pd.to_datetime(start_date)) & (df['date'] <= pd.to_datetime(end_date))
+        df = df[mask].sort_values('date').reset_index(drop=True)
+        if len(df) > 0:
+            _record_status('akshare资金流', True, f'{len(df)}天, {elapsed:.1f}s')
+        else:
+            _record_status('akshare资金流', False, f'过滤后空, {elapsed:.1f}s')
+        return df
     except Exception as e:
-        _record_status('AkShare-东财资金流', False, str(e)[:80])
+        _record_status('akshare资金流', False, f'{type(e).__name__}: {str(e)[:80]}')
+        return pd.DataFrame()
 
-    # 源2: efinance - 同花顺资金流
-    try:
-        import efinance as ef
-        df = ef.stock.get_history_bill(code)
-        if df is not None and len(df) > 0:
-            # efinance列名映射
-            col_map = {}
-            for col in df.columns:
-                if '日期' in str(col): col_map[col] = 'date'
-                elif '主力净流入' in str(col): col_map[col] = 'main_net_inflow'
-                elif '超大单净流入' in str(col): col_map[col] = 'super_large_net'
-                elif '大单净流入' in str(col): col_map[col] = 'large_net'
-                elif '中单净流入' in str(col): col_map[col] = 'medium_net'
-                elif '小单净流入' in str(col): col_map[col] = 'small_net'
-                elif '收盘' in str(col): col_map[col] = 'close'
-            df = df.rename(columns=col_map)
-            if 'date' in df.columns and 'main_net_inflow' in df.columns:
-                df['date'] = pd.to_datetime(df['date'])
-                for c in ['main_net_inflow', 'super_large_net', 'large_net', 'medium_net', 'small_net', 'close']:
-                    if c in df.columns:
-                        df[c] = pd.to_numeric(df[c], errors='coerce')
-                if 'main_net_pct' not in df.columns:
-                    df['main_net_pct'] = 0.0
-                df = df.sort_values('date').reset_index(drop=True)
-                df = _filter_flow_dates(df, start_date, end_date)
-                if len(df) > 0:
-                    _record_status('efinance-同花顺资金流', True, f'{len(df)}天')
-                    return df
-        _record_status('efinance-同花顺资金流', False, '返回空或列不匹配')
-    except Exception as e:
-        _record_status('efinance-同花顺资金流', False, str(e)[:80])
 
-    # 源3: AkShare - 新浪资金流
-    try:
-        import akshare as ak
-        df = ak.stock_individual_fund_flow_rank(indicator='今日')
-        if df is not None and len(df) > 0:
-            # 新浪资金流是全市场排名，需要筛选个股
-            code_col = None
-            for col in df.columns:
-                if '代码' in str(col) or 'code' in str(col).lower():
-                    code_col = col
-                    break
-            if code_col:
-                df[code_col] = df[code_col].astype(str).str.zfill(6)
-                df = df[df[code_col] == code]
-                if len(df) > 0:
-                    _record_status('AkShare-新浪资金流', True, f'{len(df)}条(仅当日)')
-                    # 新浪只有当日数据，构造单日DataFrame
-                    row = df.iloc[0]
-                    today = datetime.now().strftime('%Y-%m-%d')
-                    result = pd.DataFrame([{
-                        'date': pd.to_datetime(today),
-                        'main_net_inflow': pd.to_numeric(row.get('主力净流入-净额', 0), errors='coerce'),
-                        'super_large_net': pd.to_numeric(row.get('超大单净流入-净额', 0), errors='coerce'),
-                        'large_net': pd.to_numeric(row.get('大单净流入-净额', 0), errors='coerce'),
-                        'medium_net': pd.to_numeric(row.get('中单净流入-净额', 0), errors='coerce'),
-                        'small_net': pd.to_numeric(row.get('小单净流入-净额', 0), errors='coerce'),
-                        'main_net_pct': pd.to_numeric(row.get('主力净流入-净占比', 0), errors='coerce'),
-                        'close': pd.to_numeric(row.get('最新价', 0), errors='coerce'),
-                    }])
-                    return result
-        _record_status('AkShare-新浪资金流', False, '未找到个股或返回空')
-    except Exception as e:
-        _record_status('AkShare-新浪资金流', False, str(e)[:80])
-
-    _record_status('全部资金流源', False, '3个源均失败')
+def fetch_capital_flow(code, start_date, end_date):
+    """多源获取个股资金流：东方财富直连API(首选) → akshare(备选)"""
+    df = _fetch_flow_eastmoney_direct(code, start_date, end_date)
+    if len(df) > 0:
+        return df
+    df = _fetch_flow_akshare(code, start_date, end_date)
+    if len(df) > 0:
+        return df
+    _record_status('全部资金流源', False, '2个源均失败')
     return pd.DataFrame()
 
 
-def _standardize_flow_df(df):
-    """标准化资金流DataFrame列名"""
-    col_map = {}
-    for col in df.columns:
-        col_str = str(col)
-        if '日期' in col_str or col_str.lower() == 'date':
-            col_map[col] = 'date'
-        elif '主力净流入-净额' in col_str or ('主力' in col_str and '净额' in col_str):
-            col_map[col] = 'main_net_inflow'
-        elif '超大单净流入-净额' in col_str or ('超大单' in col_str and '净额' in col_str):
-            col_map[col] = 'super_large_net'
-        elif '大单净流入-净额' in col_str or ('大单' in col_str and '净额' in col_str):
-            col_map[col] = 'large_net'
-        elif '中单净流入-净额' in col_str or ('中单' in col_str and '净额' in col_str):
-            col_map[col] = 'medium_net'
-        elif '小单净流入-净额' in col_str or ('小单' in col_str and '净额' in col_str):
-            col_map[col] = 'small_net'
-        elif '主力净流入-净占比' in col_str or ('主力' in col_str and '占比' in col_str):
-            col_map[col] = 'main_net_pct'
-        elif '收盘价' in col_str or ('close' in col_str.lower() and 'net' not in col_str.lower()):
-            col_map[col] = 'close'
-    df = df.rename(columns=col_map)
-    for c in ['main_net_inflow', 'super_large_net', 'large_net', 'medium_net', 'small_net', 'main_net_pct', 'close']:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'])
-    return df.sort_values('date').reset_index(drop=True) if 'date' in df.columns else df
-
-
-def _filter_flow_dates(df, start_date, end_date):
-    """按日期过滤资金流数据"""
-    if 'date' not in df.columns or len(df) == 0:
-        return df
-    mask = (df['date'] >= pd.to_datetime(start_date)) & (df['date'] <= pd.to_datetime(end_date))
-    return df[mask].reset_index(drop=True)
-
-
 # ============================================================
-# 实时行情数据源（用于实时信号）
+# 实时行情数据源
 # ============================================================
 def fetch_realtime_quote(code):
-    """
-    多源获取实时行情，按优先级依次尝试。
-    返回: dict (price, open, high, low, volume, amount, change_pct, source)
-    """
+    """多源获取实时行情：腾讯财经直连 → 东方财富直连"""
     # 源1: 腾讯财经直连
     try:
-        import urllib.request
         market = 'sh' if code.startswith(('60', '68', '90', '11', '13', '51', '58')) else 'sz'
         url = f"http://qt.gtimg.cn/q={market}{code}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        resp = urllib.request.urlopen(req, timeout=8)
-        text = resp.read().decode('gbk')
+        raw = _http_get(url, timeout=8)
+        text = raw.decode('gbk')
         parts = text.split('~')
-        if len(parts) > 30:
+        if len(parts) > 37:
             result = {
-                'price': float(parts[3]),
-                'open': float(parts[5]),
-                'high': float(parts[33]),
-                'low': float(parts[34]),
-                'volume': float(parts[6]),
-                'amount': float(parts[37]) if parts[37] else 0,
-                'change_pct': float(parts[32]),
-                'source': '腾讯财经'
+                'price': float(parts[3]), 'open': float(parts[5]),
+                'high': float(parts[33]), 'low': float(parts[34]),
+                'volume': float(parts[6]), 'amount': float(parts[37]) if parts[37] else 0,
+                'change_pct': float(parts[32]), 'source': '腾讯财经'
             }
             _record_status('腾讯实时行情', True, f'¥{result["price"]}')
             return result
         _record_status('腾讯实时行情', False, '解析失败')
     except Exception as e:
-        _record_status('腾讯实时行情', False, str(e)[:80])
+        _record_status('腾讯实时行情', False, f'{type(e).__name__}: {str(e)[:60]}')
 
-    # 源2: AkShare - 东方财富实时行情
+    # 源2: 东方财富直连
     try:
-        import akshare as ak
-        df = ak.stock_zh_a_spot_em()
-        if df is not None and len(df) > 0:
-            code_col = None
-            for col in df.columns:
-                if '代码' in str(col):
-                    code_col = col
-                    break
-            if code_col:
-                df[code_col] = df[code_col].astype(str).str.zfill(6)
-                row = df[df[code_col] == code]
-                if len(row) > 0:
-                    r = row.iloc[0]
-                    result = {
-                        'price': float(r.get('最新价', 0)),
-                        'open': float(r.get('今开', 0)),
-                        'high': float(r.get('最高', 0)),
-                        'low': float(r.get('最低', 0)),
-                        'volume': float(r.get('成交量', 0)),
-                        'amount': float(r.get('成交额', 0)),
-                        'change_pct': float(r.get('涨跌幅', 0)),
-                        'source': '东方财富'
-                    }
-                    _record_status('AkShare-东财实时', True, f'¥{result["price"]}')
-                    return result
-        _record_status('AkShare-东财实时', False, '未找到个股')
+        secid = _get_secid(code)
+        url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f170&ut=b2884a393a59ad64002292a3e90d46a5"
+        raw = _http_get(url, timeout=8, headers={'Referer': 'https://quote.eastmoney.com/'})
+        data = json.loads(raw.decode('utf-8'))
+        d = data.get('data', {})
+        if d and d.get('f43'):
+            result = {
+                'price': float(d['f43']) / 100, 'open': float(d['f46']) / 100,
+                'high': float(d['f44']) / 100, 'low': float(d['f45']) / 100,
+                'volume': float(d.get('f47', 0)), 'amount': float(d.get('f48', 0)),
+                'change_pct': float(d.get('f170', 0)) / 100, 'source': '东方财富'
+            }
+            _record_status('东财实时行情', True, f'¥{result["price"]}')
+            return result
+        _record_status('东财实时行情', False, '无数据')
     except Exception as e:
-        _record_status('AkShare-东财实时', False, str(e)[:80])
+        _record_status('东财实时行情', False, f'{type(e).__name__}: {str(e)[:60]}')
 
-    # 源3: Yahoo Finance
-    try:
-        import yfinance as yf
-        ticker = f"{code}.SS" if code.startswith(('60', '68', '90')) else f"{code}.SZ"
-        tk = yf.Ticker(ticker)
-        info = tk.fast_info
-        result = {
-            'price': float(info.last_price),
-            'open': float(info.open),
-            'high': float(info.day_high),
-            'low': float(info.day_low),
-            'volume': float(info.last_volume),
-            'amount': 0,
-            'change_pct': 0,
-            'source': 'Yahoo Finance'
-        }
-        _record_status('Yahoo实时行情', True, f'¥{result["price"]}')
-        return result
-    except Exception as e:
-        _record_status('Yahoo实时行情', False, str(e)[:80])
-
-    _record_status('全部实时行情源', False, '3个源均失败')
+    _record_status('全部实时行情源', False, '2个源均失败')
     return None

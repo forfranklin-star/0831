@@ -164,11 +164,17 @@ def detect_macd_divergence(df, lookback=20):
     顶背离：价格创新高但MACD_DIF不创新高
     底背离：价格创新低但MACD_DIF不创新低
     """
-    if 'MACD_DIF' not in df.columns:
+    # 兼容多种列名命名
+    dif_col = None
+    for col in ['MACD_DIF', 'DIF', 'macd_dif', 'dif']:
+        if col in df.columns:
+            dif_col = col
+            break
+    if dif_col is None:
         return [], []
 
     closes = df['close'].values
-    dif = df['MACD_DIF'].values
+    dif = df[dif_col].values
     n = len(df)
     bearish_div = []  # 顶背离
     bullish_div = []  # 底背离
@@ -201,10 +207,15 @@ def detect_rsi_reversal(df, overbought=70, oversold=30):
     """
     检测RSI超买后回落（顶部信号）和超卖后回升（底部信号）。
     """
-    if 'RSI_14' not in df.columns:
+    rsi_col = None
+    for col in ['RSI_14', 'RSI14', 'rsi_14', 'rsi14', 'RSI']:
+        if col in df.columns:
+            rsi_col = col
+            break
+    if rsi_col is None:
         return [], []
 
-    rsi = df['RSI_14'].values
+    rsi = df[rsi_col].values
     n = len(df)
     tops = []
     bottoms = []
@@ -228,11 +239,21 @@ def detect_kdj_signals(df, overbought=80, oversold=20):
     """
     检测KDJ超买死叉（顶部）和超卖金叉（底部）。
     """
-    if 'KDJ_K' not in df.columns or 'KDJ_D' not in df.columns:
+    k_col = None
+    d_col = None
+    for col in ['KDJ_K', 'K', 'kdj_k', 'k']:
+        if col in df.columns:
+            k_col = col
+            break
+    for col in ['KDJ_D', 'D', 'kdj_d', 'd']:
+        if col in df.columns:
+            d_col = col
+            break
+    if k_col is None or d_col is None:
         return [], []
 
-    k = df['KDJ_K'].values
-    d = df['KDJ_D'].values
+    k = df[k_col].values
+    d = df[d_col].values
     n = len(df)
     tops = []
     bottoms = []
@@ -256,12 +277,22 @@ def detect_bollinger_reversal(df):
     """
     检测价格触碰布林上轨后回落（顶部）和触碰下轨后回升（底部）。
     """
-    if 'BOLL_UPPER' not in df.columns or 'BOLL_LOWER' not in df.columns:
+    upper_col = None
+    lower_col = None
+    for col in ['BOLL_UPPER', 'BOLL_UP', 'boll_upper', 'boll_up', 'UPPER', 'UP']:
+        if col in df.columns:
+            upper_col = col
+            break
+    for col in ['BOLL_LOWER', 'BOLL_LOW', 'boll_lower', 'boll_low', 'LOWER', 'LOW']:
+        if col in df.columns:
+            lower_col = col
+            break
+    if upper_col is None or lower_col is None:
         return [], []
 
     close = df['close'].values
-    upper = df['BOLL_UPPER'].values
-    lower = df['BOLL_LOWER'].values
+    upper = df[upper_col].values
+    lower = df[lower_col].values
     n = len(df)
     tops = []
     bottoms = []
@@ -564,19 +595,34 @@ def run_swing_analysis(df, timeframe='daily', holding_days=5):
     4. 回测验证
     5. 返回详细结果
     """
-    if df is None or len(df) < 60:
-        return {'error': '数据不足，至少需要60根K线'}
+    if df is None or len(df) < 30:
+        return {'error': f'数据不足（仅{len(df) if df is not None else 0}根K线），至少需要30根'}
 
     df = df.reset_index(drop=True)
+    data_warning = None
+    if len(df) < 60:
+        data_warning = f'K线数据较少（{len(df)}根），部分长周期指标可能不可用，识别精度可能降低'
+
+    # 根据数据量自动调整参数
+    if len(df) < 60:
+        default_swing = 2
+        default_zigzag = 0.05
+        default_threshold = 2
+        max_grid_combos = 15
+    else:
+        default_swing = 3
+        default_zigzag = 0.08
+        default_threshold = 3
+        max_grid_combos = 30 if timeframe == '60min' else 50
 
     # 1. 默认参数检测
     default_params = {
-        'swing_left': 3, 'swing_right': 3,
-        'zigzag_pct': 0.08,
+        'swing_left': default_swing, 'swing_right': default_swing,
+        'zigzag_pct': default_zigzag,
         'rsi_ob': 70, 'rsi_os': 30,
         'kdj_ob': 80, 'kdj_os': 20,
         'vol_ratio': 1.5,
-        'top_threshold': 3, 'bottom_threshold': 3,
+        'top_threshold': default_threshold, 'bottom_threshold': default_threshold,
         'weights': {
             'swing': 2.0, 'fractal': 1.0, 'zigzag': 2.0,
             'macd_div': 1.5, 'rsi': 1.0, 'kdj': 1.0,

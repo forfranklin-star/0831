@@ -845,7 +845,8 @@ if result:
         swing = result.get('swing_detection')
         if not swing or 'error' in swing:
             err = swing.get('error', '波段识别未执行') if swing else '波段识别未执行'
-            st.info(f"📐 {err}（需至少60根K线数据）")
+            st.error(f"📐 波段识别失败：{err}")
+            st.info("💡 请检查数据是否充足（建议至少60根K线），或尝试更换股票代码/时间范围后重试。")
         else:
             st.markdown(f"#### 📐 波段顶/底识别（{swing.get('timeframe','日线')}，参数自动优化）")
 
